@@ -7,6 +7,7 @@ enforces that.
 from __future__ import annotations
 
 from .block import BlockDefinitionError, BlockSpec, Port, PortKind, block
+from .executor import StopExecution
 from .types import Mat, Preview, is_compatible, type_name
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "BlockSpec",
     "BlockDefinitionError",
     "block",
+    "StopExecution",
     "is_compatible",
     "type_name",
 ]

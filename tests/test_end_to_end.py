@@ -237,3 +237,95 @@ def test_console_script_runs_in_a_subprocess(args: list[str]):
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+# -- phase 1: stateful sources and tolerant execution --------------------
+
+MOTION = FIXTURES / "motion.yaml"
+
+
+def test_motion_fixture_validates(capsys, real_blocks):
+    assert main(["check", str(MOTION)]) == 0
+    out = capsys.readouterr().out
+    assert "ok -- 7 nodes, 7 edges" in out
+    assert "video -> prev -> diff" in out
+
+
+def test_motion_fixture_runs_to_the_end_of_the_video(capsys, real_blocks):
+    """-n 0 must terminate on its own: the source stops the run."""
+    assert main(["run", str(MOTION), "-n", "0"]) == 0
+    captured = capsys.readouterr()
+    assert "motion_mask" in captured.out
+    assert "no more frames" in captured.err
+
+
+def test_motion_detects_movement(real_blocks):
+    graph = io.load(MOTION)
+    with Executor(graph) as executor:
+        first = executor.step(0)
+        second = executor.step(1)
+    assert first.value("motion", "output") == 0, "a frame against itself is still"
+    assert second.value("motion", "output") > 0, "the square moved"
+
+
+def test_video_paths_resolve_relative_to_the_diagram(real_blocks, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["run", str(MOTION), "-n", "2"]) == 0
+
+
+def test_stateful_nodes_are_listed_in_verbose_mode(capsys, real_blocks):
+    assert main(["-v", "run", str(MOTION), "-n", "1"]) == 0
+    assert "stateful: video, prev" in capsys.readouterr().err
+
+
+def test_on_error_skip_keeps_independent_branches_running(
+    tmp_path, capsys, real_blocks
+):
+    """One broken branch must not stop the other."""
+    diagram = tmp_path / "d.yaml"
+    diagram.write_text(
+        "version: 1\n"
+        "nodes:\n"
+        f"  good: {{block: imread, params: {{path: {FIXTURES / 'checkerboard.png'}}}}}\n"
+        "  bad:  {block: imread, params: {path: /nonexistent/x.png}}\n"
+        "  edge: {block: canny}\n"
+        "  show: {block: preview, params: {title: from_bad}}\n"
+        "edges:\n"
+        "  - good.output -> edge.input\n"
+        "  - bad.output -> show.input\n",
+        encoding="utf-8",
+    )
+    assert main(["run", str(diagram), "--on-error", "skip"]) == 3
+    err = capsys.readouterr().err
+    assert "error in bad" in err
+    assert "skipped: show" in err
+    assert "error in good" not in err
+
+
+def test_on_error_raise_is_the_default(tmp_path, capsys, real_blocks):
+    diagram = tmp_path / "d.yaml"
+    diagram.write_text(
+        "version: 1\nnodes:\n  bad: {block: imread, params: {path: /nope.png}}\n",
+        encoding="utf-8",
+    )
+    assert main(["run", str(diagram)]) == 3
+    assert "node 'bad'" in capsys.readouterr().err
+
+
+def test_executor_releases_sources_after_a_cli_run(real_blocks):
+    """A camera or file must not stay claimed once the run is over."""
+    graph = io.load(MOTION)
+    executor = Executor(graph)
+    executor.step()
+    instance = executor._instances["video"]
+    assert instance._capture is not None
+    executor.close()
+    assert instance._capture is None
+
+
+def test_stateful_blocks_appear_in_the_block_list(capsys, real_blocks):
+    assert main(["blocks"]) == 0
+    out = capsys.readouterr().out
+    assert "video_file(path: Path, loop: bool = False)" in out
+    assert "camera(index: int = 0" in out
+    assert "(image: Mat, index: int, fps: float)" in out

@@ -32,6 +32,7 @@ is simpler and strictly more capable.
 from __future__ import annotations
 
 import inspect
+import re
 import sys
 import typing
 from collections.abc import Callable
@@ -107,6 +108,15 @@ class BlockSpec:
     inputs: tuple[Port, ...]
     outputs: tuple[Port, ...]
     fn: Callable[..., Any]
+    factory: type | None = None
+    """For a stateful block, the class to instantiate once per node.
+
+    ``None`` for a plain function, which needs no instance.
+    """
+
+    @property
+    def is_stateful(self) -> bool:
+        return self.factory is not None
 
     def input(self, name: str) -> Port | None:
         return next((p for p in self.inputs if p.name == name), None)
@@ -129,10 +139,41 @@ class BlockSpec:
             out = "(" + ", ".join(p.describe() for p in self.outputs) + ")"
         return f"{self.name}({args}) -> {out}"
 
-    def call(self, values: dict[str, Any]) -> dict[str, Any]:
-        """Invoke the block and return its outputs keyed by port name."""
-        result = self.fn(**values)
+    def instantiate(self) -> Any | None:
+        """Create the per-node instance of a stateful block, or ``None``."""
+        if self.factory is None:
+            return None
+        return self.factory()
+
+    def call(self, values: dict[str, Any], instance: Any | None = None) -> dict[str, Any]:
+        """Invoke the block and return its outputs keyed by port name.
+
+        A stateful block needs the ``instance`` that :meth:`instantiate`
+        produced; the executor keeps one per node.
+        """
+        if self.factory is not None:
+            if instance is None:
+                raise TypeError(
+                    f"block {self.name!r} is stateful and needs an instance; "
+                    f"call spec.instantiate() once per node"
+                )
+            result = instance(**values)
+        else:
+            result = self.fn(**values)
         return self._map_outputs(result)
+
+    def close(self, instance: Any | None) -> None:
+        """Release whatever the instance holds, if it says how.
+
+        flodiedi had no counterpart: its ``VideoFile`` block opened a
+        ``VideoCapture`` and never closed it, so the device stayed claimed
+        until the process ended.
+        """
+        if instance is None:
+            return
+        closer = getattr(instance, "close", None)
+        if callable(closer):
+            closer()
 
     def _map_outputs(self, result: Any) -> dict[str, Any]:
         if not self.outputs:
@@ -181,10 +222,14 @@ def _resolve_hints(
         ) from exc
 
 
-def _build_inputs(fn: Callable[..., Any], hints: dict[str, Any]) -> tuple[Port, ...]:
+def _build_inputs(
+    fn: Callable[..., Any], hints: dict[str, Any], skip: frozenset[str] = frozenset()
+) -> tuple[Port, ...]:
     sig = inspect.signature(fn)
     ports: list[Port] = []
     for name, param in sig.parameters.items():
+        if name in skip:
+            continue
         if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
             raise BlockDefinitionError(
                 f"block {fn.__name__!r}: *args/**kwargs cannot be turned into ports "
@@ -254,6 +299,75 @@ def _spec_from_function(
     )
 
 
+def _spec_from_class(
+    cls: type,
+    *,
+    name: str | None,
+    category: str,
+    localns: dict[str, Any] | None = None,
+) -> BlockSpec:
+    """Derive a stateful block's spec from its ``__call__``.
+
+    Ports come from ``__call__``, deliberately not from ``__init__``. The port
+    model established for functions is that *every* parameter is a connectable
+    input, optional when it has a default. Putting parameters in the
+    constructor would make them unconnectable and split the model in two.
+
+    ``__init__`` therefore takes no ports. State is built lazily in
+    ``__call__`` -- which also means a block sees a changed ``path`` and can
+    react, rather than being stuck with whatever it was constructed with.
+    """
+    # Not getattr(): every class inherits type.__call__, so getattr always
+    # succeeds and would silently derive ports from (*args, **kwargs).
+    call = None
+    for klass in cls.__mro__:
+        if klass is object:
+            break
+        if "__call__" in klass.__dict__:
+            call = klass.__dict__["__call__"]
+            break
+    if call is None or not callable(call):
+        raise BlockDefinitionError(
+            f"block class {cls.__name__!r} needs a __call__ method; that is where "
+            f"its ports are declared."
+        )
+
+    init = cls.__dict__.get("__init__")
+    if init is not None:
+        required = [
+            parameter
+            for parameter_name, parameter in inspect.signature(init).parameters.items()
+            if parameter_name != "self"
+            and parameter.default is parameter.empty
+            and parameter.kind
+            not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+        ]
+        if required:
+            names = ", ".join(p.name for p in required)
+            raise BlockDefinitionError(
+                f"block class {cls.__name__!r}: __init__ must be callable with no "
+                f"arguments, but {names} is required. Declare parameters on "
+                f"__call__ instead, so they can be connected."
+            )
+
+    hints = _resolve_hints(call, localns)
+    inputs = _build_inputs(call, hints, skip=frozenset({"self"}))
+    return BlockSpec(
+        name=name or _default_class_block_name(cls),
+        category=category,
+        doc=inspect.cleandoc(cls.__doc__ or call.__doc__ or ""),
+        inputs=inputs,
+        outputs=_build_outputs(call, hints, localns),
+        fn=call,
+        factory=cls,
+    )
+
+
+def _default_class_block_name(cls: type) -> str:
+    """``VideoFile`` -> ``video_file``, to keep block names snake_case."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", cls.__name__).lower()
+
+
 def _caller_locals(depth: int = 2) -> dict[str, Any] | None:
     """The local scope at the block's definition site, if obtainable."""
     try:
@@ -291,17 +405,13 @@ def block(
 
     def decorate(target: Callable[..., Any]) -> Callable[..., Any]:
         if isinstance(target, type):
-            # Stateful blocks (flodiedi's VideoFile held a VideoCapture and a
-            # mutex as members) will be classes. The port derivation differs --
-            # __init__ carries the parameters, __call__ the ports -- so this is
-            # refused explicitly rather than misinterpreted.
-            raise BlockDefinitionError(
-                f"{target.__name__!r} is a class. Class-based (stateful) blocks are "
-                f"not implemented yet; use a function for now."
+            spec = _spec_from_class(
+                target, name=name, category=category, localns=localns
             )
-        spec = _spec_from_function(
-            target, name=name, category=category, localns=localns
-        )
+        else:
+            spec = _spec_from_function(
+                target, name=name, category=category, localns=localns
+            )
         target.spec = spec  # type: ignore[attr-defined]
 
         if register_globally:

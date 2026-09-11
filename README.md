@@ -6,7 +6,7 @@ Visual dataflow for image processing: build a graph of processing blocks, run it
 see what comes out. flodiedi was written 2010–2013 in C++/Qt4; this is the same
 idea in Python, where most of its machinery turns out to be unnecessary.
 
-**Status: phase 0 — the core runs headless. No GUI yet.**
+**Status: phase 1 — the core runs headless, including live camera and video. No GUI yet.**
 
 ## Why a rewrite rather than a port
 
@@ -48,13 +48,20 @@ uv sync
 ## Use
 
 ```sh
-uv run pydiedi blocks                          # list blocks and their ports
-uv run pydiedi blocks -v                       # with docs and enum choices
-uv run pydiedi check  tests/fixtures/basic.yaml # validate without running
-uv run pydiedi run    tests/fixtures/basic.yaml # execute
+uv run pydiedi blocks                           # list blocks and their ports
+uv run pydiedi blocks -v                        # with docs and enum choices
+uv run pydiedi check tests/fixtures/basic.yaml  # validate without running
+uv run pydiedi run   tests/fixtures/basic.yaml  # execute one sweep
+uv run pydiedi run   tests/fixtures/motion.yaml -n 0   # frame differencing over a video
 uv run pydiedi run diagram.yaml --save-previews out/
-uv run pydiedi run diagram.yaml -n 0 --interval 0.03   # loop until interrupted
+uv run pydiedi run diagram.yaml -n 0 --interval 0.03   # loop; Ctrl-C to stop
+uv run pydiedi run diagram.yaml --on-error skip        # keep other branches alive
 ```
+
+`-n 0` sweeps until something stops the run — a keystroke, or a source that
+reached its end. A `video_file` raises `StopExecution` after the last frame, so
+a run over a file terminates on its own; flodiedi expressed the same idea as a
+`terminateExecution` block.
 
 ## The diagram format
 
@@ -111,6 +118,12 @@ result is visible in its own repository: `loadPointCloudplugin` shipped with
 pydiedi/
 ├── core/          no Qt, no cv2 — graph, executor, blocks, file format
 ├── blocks/        the block library; cv2 and numpy, never a GUI toolkit
+│   ├── sources.py     camera, video_file, frame_buffer  (stateful)
+│   ├── imageio.py     imread, imwrite
+│   ├── basic.py       arithmetic, masking, measures
+│   ├── filtering.py   blur, threshold, canny
+│   ├── colours.py     cvt_color
+│   └── display.py     preview, side_by_side
 ├── gui/           phase 3, PySide6
 └── cli.py         headless runner
 ```
@@ -146,36 +159,75 @@ rather than by position:
 ```python
 class Frame(NamedTuple):
     image: Mat
-    fps: int
-
-@block(category="imageio")
-def video_file(path: Path) -> Frame: ...
+    index: int
+    fps: float
 ```
 
 Blocks may be declared anywhere — a module, a function, a notebook cell.
 
+### Stateful blocks
+
+A block that must remember something across sweeps is a class. Ports are
+declared on `__call__`, state lives on `self`, and `close()` releases whatever
+was acquired:
+
+```python
+@block(category="sources")
+class VideoFile:
+    def __init__(self) -> None:
+        self._capture = None
+
+    def __call__(self, path: Path, loop: bool = False) -> Frame:
+        ...
+
+    def close(self) -> None:
+        if self._capture is not None:
+            self._capture.release()
+```
+
+Ports go on `__call__` and **not** on `__init__`, deliberately: a constructor
+parameter could not be driven by an edge, which would split the port model in
+two. The side benefit is that a changed `path` simply takes effect — flodiedi
+needed an explicit `setFilename()` slot to reload its capture.
+
+Each node gets its own instance, so two `camera` nodes are two devices. The
+executor is a context manager, and closing it releases every source:
+
+```python
+with Executor(graph) as executor:
+    executor.run(iterations=0)
+```
+
+flodiedi's `VideoFile` opened a `VideoCapture` and never released it; the
+device stayed claimed until the process ended.
+
+### When a block fails
+
+`--on-error raise` (the default) stops at the first failure, which is what a
+script wants. `--on-error skip` records it, skips whatever depended on it, and
+keeps independent branches running — which is what an editor wants, so that one
+red node does not halt the diagram.
+
 ## Test
 
 ```sh
-uv run pytest            # 112 tests
+uv run pytest            # 155 tests
 ```
 
-## Known limitations (phase 0)
+## Known limitations
 
-- **No GUI.** Diagrams are written by hand or generated; phase 3 brings PySide6.
-- **Stateful blocks are not supported.** flodiedi's `VideoFile` held a
-  `VideoCapture` as a member; such blocks will be classes. The decorator
-  currently refuses a class with an explicit message rather than
-  misinterpreting it.
+- **No GUI.** Diagrams are written by hand for now; phase 3 brings PySide6.
 - **Execution is serial.** One sweep in topological order, as in flodiedi.
   Running independent branches in parallel is feasible — `cv2` releases the
   GIL — but correctness first.
 - **Type compatibility is strict.** Identical types only. flodiedi's conversion
   table (`Plugins/datatypes`: `double->int`, `Mat->Mat1f`) arrives once there is
   a second Mat-like type to convert between.
-- **Eight blocks.** The remaining ~140 are mechanical; the 3,576 lines of
-  hand-written logic in flodiedi's plugins are the asset worth translating
+- **20 blocks.** The remaining ~120 worth having are mechanical; the 3,576 lines
+  of hand-written logic in flodiedi's plugins are the asset worth translating
   carefully rather than generating blindly.
+- **No sub-diagrams.** flodiedi had `SubDiagram`/`SubXML` blocks, though it had
+  commented the inline variant out of its own plugin registry.
 
 ## Licence
 

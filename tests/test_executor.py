@@ -26,17 +26,17 @@ from pydiedi.core.types import CoercionError, Preview
 # -- test blocks, defined once and registered per test --------------------
 
 
-@block(category="t", name="const", register_globally=False)
+@block(category="t", name="t_const", register_globally=False)
 def const(value: int = 1) -> int:
     return value
 
 
-@block(category="t", name="inc", register_globally=False)
+@block(category="t", name="t_inc", register_globally=False)
 def inc(input: int, by: int = 1) -> int:
     return input + by
 
 
-@block(category="t", name="add", register_globally=False)
+@block(category="t", name="t_add", register_globally=False)
 def add(a: int, b: int) -> int:
     return a + b
 
@@ -46,22 +46,22 @@ class Split(NamedTuple):
     hi: int
 
 
-@block(category="t", name="split", register_globally=False)
+@block(category="t", name="t_split", register_globally=False)
 def split(input: int) -> Split:
     return Split(lo=input - 1, hi=input + 1)
 
 
-@block(category="t", name="boom", register_globally=False)
+@block(category="t", name="t_boom", register_globally=False)
 def boom(input: int) -> int:
     raise RuntimeError("deliberate failure")
 
 
-@block(category="t", name="show", register_globally=False)
+@block(category="t", name="t_show", register_globally=False)
 def show(input: int) -> Preview:
     return Preview(title=f"value={input}")
 
 
-@block(category="t", name="sink", register_globally=False)
+@block(category="t", name="t_sink", register_globally=False)
 def sink(input: int) -> None:
     return None
 
@@ -91,7 +91,7 @@ def build(nodes: dict[str, tuple[str, dict]], edges: list[str]) -> Graph:
 
 def test_linear_chain_runs_in_order():
     graph = build(
-        {"a": ("const", {"value": 1}), "b": ("inc", {}), "c": ("inc", {})},
+        {"a": ("t_const", {"value": 1}), "b": ("t_inc", {}), "c": ("t_inc", {})},
         ["a.output -> b.input", "b.output -> c.input"],
     )
     assert topological_order(graph) == ["a", "b", "c"]
@@ -103,10 +103,10 @@ def test_fan_out_feeds_both_branches():
     """One output into two inputs -- the case a linear chain would not catch."""
     graph = build(
         {
-            "src": ("const", {"value": 10}),
-            "left": ("inc", {"by": 1}),
-            "right": ("inc", {"by": 100}),
-            "join": ("add", {}),
+            "src": ("t_const", {"value": 10}),
+            "left": ("t_inc", {"by": 1}),
+            "right": ("t_inc", {"by": 100}),
+            "join": ("t_add", {}),
         },
         [
             "src.output -> left.input",
@@ -123,7 +123,7 @@ def test_fan_out_feeds_both_branches():
 
 def test_fan_in_from_multiple_outputs_of_one_block():
     graph = build(
-        {"src": ("const", {"value": 5}), "s": ("split", {}), "join": ("add", {})},
+        {"src": ("t_const", {"value": 5}), "s": ("t_split", {}), "join": ("t_add", {})},
         ["src.output -> s.input", "s.lo -> join.a", "s.hi -> join.b"],
     )
     result = Executor(graph).step()
@@ -134,10 +134,10 @@ def test_fan_in_from_multiple_outputs_of_one_block():
 def test_order_is_deterministic_across_runs():
     graph = build(
         {
-            "z": ("const", {}),
-            "y": ("const", {}),
-            "x": ("const", {}),
-            "j": ("add", {}),
+            "z": ("t_const", {}),
+            "y": ("t_const", {}),
+            "x": ("t_const", {}),
+            "j": ("t_add", {}),
         },
         ["z.output -> j.a", "y.output -> j.b"],
     )
@@ -146,7 +146,7 @@ def test_order_is_deterministic_across_runs():
 
 
 def test_independent_nodes_all_execute():
-    graph = build({"a": ("const", {}), "b": ("const", {})}, [])
+    graph = build({"a": ("t_const", {}), "b": ("t_const", {})}, [])
     result = Executor(graph).step()
     assert set(result.outputs) == {"a", "b"}
 
@@ -155,14 +155,14 @@ def test_independent_nodes_all_execute():
 
 
 def test_self_loop_is_rejected():
-    graph = build({"a": ("inc", {})}, ["a.output -> a.input"])
+    graph = build({"a": ("t_inc", {})}, ["a.output -> a.input"])
     with pytest.raises(CycleError, match="a -> a"):
         topological_order(graph)
 
 
 def test_two_node_cycle_is_rejected_and_named():
     graph = build(
-        {"a": ("inc", {}), "b": ("inc", {})},
+        {"a": ("t_inc", {}), "b": ("t_inc", {})},
         ["a.output -> b.input", "b.output -> a.input"],
     )
     with pytest.raises(CycleError) as excinfo:
@@ -173,7 +173,7 @@ def test_two_node_cycle_is_rejected_and_named():
 
 def test_longer_cycle_is_named():
     graph = build(
-        {"a": ("inc", {}), "b": ("inc", {}), "c": ("inc", {})},
+        {"a": ("t_inc", {}), "b": ("t_inc", {}), "c": ("t_inc", {})},
         ["a.output -> b.input", "b.output -> c.input", "c.output -> a.input"],
     )
     with pytest.raises(CycleError, match=r"a -> b -> c -> a"):
@@ -182,7 +182,7 @@ def test_longer_cycle_is_named():
 
 def test_cycle_is_reported_even_with_a_valid_prefix():
     graph = build(
-        {"src": ("const", {}), "a": ("add", {}), "b": ("inc", {})},
+        {"src": ("t_const", {}), "a": ("t_add", {}), "b": ("t_inc", {})},
         ["src.output -> a.a", "a.output -> b.input", "b.output -> a.b"],
     )
     with pytest.raises(CycleError):
@@ -193,13 +193,13 @@ def test_cycle_is_reported_even_with_a_valid_prefix():
 
 
 def test_params_supply_values_for_unconnected_inputs():
-    graph = build({"a": ("inc", {"input": 5, "by": 3})}, [])
+    graph = build({"a": ("t_inc", {"input": 5, "by": 3})}, [])
     assert Executor(graph).step().value("a", "output") == 8
 
 
 def test_connection_overrides_nothing_but_supplies_the_port():
     graph = build(
-        {"src": ("const", {"value": 7}), "a": ("inc", {"by": 3})},
+        {"src": ("t_const", {"value": 7}), "a": ("t_inc", {"by": 3})},
         ["src.output -> a.input"],
     )
     assert Executor(graph).step().value("a", "output") == 10
@@ -207,7 +207,7 @@ def test_connection_overrides_nothing_but_supplies_the_port():
 
 def test_previews_are_collected():
     graph = build(
-        {"src": ("const", {"value": 4}), "p": ("show", {})},
+        {"src": ("t_const", {"value": 4}), "p": ("t_show", {})},
         ["src.output -> p.input"],
     )
     result = Executor(graph).step()
@@ -216,13 +216,13 @@ def test_previews_are_collected():
 
 def test_block_without_outputs_runs():
     graph = build(
-        {"src": ("const", {}), "s": ("sink", {})}, ["src.output -> s.input"]
+        {"src": ("t_const", {}), "s": ("t_sink", {})}, ["src.output -> s.input"]
     )
     assert Executor(graph).step().outputs["s"] == {}
 
 
 def test_run_repeats_and_reports_iteration():
-    graph = build({"a": ("const", {"value": 2})}, [])
+    graph = build({"a": ("t_const", {"value": 2})}, [])
     result = Executor(graph).run(iterations=3)
     assert result.iteration == 2  # zero-based, three sweeps
 
@@ -232,13 +232,13 @@ def test_run_repeats_and_reports_iteration():
 
 def test_failing_block_names_node_block_and_cause():
     graph = build(
-        {"src": ("const", {}), "bad": ("boom", {})}, ["src.output -> bad.input"]
+        {"src": ("t_const", {}), "bad": ("t_boom", {})}, ["src.output -> bad.input"]
     )
     with pytest.raises(NodeExecutionError) as excinfo:
         Executor(graph).step()
     error = excinfo.value
     assert error.node_id == "bad"
-    assert error.block == "boom"
+    assert error.block == "t_boom"
     assert isinstance(error.cause, RuntimeError)
     assert "deliberate failure" in str(error)
 
@@ -250,28 +250,28 @@ def test_unknown_block_is_reported_with_node_id():
 
 
 def test_missing_required_input_is_reported():
-    graph = build({"a": ("add", {"a": 1})}, [])
+    graph = build({"a": ("t_add", {"a": 1})}, [])
     with pytest.raises(ValidationError, match="required input 'b'"):
         graph.validate()
 
 
 def test_unknown_port_on_edge_lists_known_ports():
     graph = build(
-        {"src": ("const", {}), "a": ("inc", {})}, ["src.output -> a.nope"]
+        {"src": ("t_const", {}), "a": ("t_inc", {})}, ["src.output -> a.nope"]
     )
     with pytest.raises(ValidationError, match="has no input 'nope'.*Known inputs"):
         graph.validate()
 
 
 def test_unknown_param_lists_known_inputs():
-    graph = build({"a": ("const", {"vlaue": 1})}, [])
+    graph = build({"a": ("t_const", {"vlaue": 1})}, [])
     with pytest.raises(ValidationError, match="no input 'vlaue'.*Known inputs: value"):
         graph.validate()
 
 
 def test_two_edges_into_one_input_is_rejected():
     graph = build(
-        {"x": ("const", {}), "y": ("const", {}), "a": ("inc", {})},
+        {"x": ("t_const", {}), "y": ("t_const", {}), "a": ("t_inc", {})},
         ["x.output -> a.input", "y.output -> a.input"],
     )
     with pytest.raises(ValidationError, match="already fed by"):
@@ -280,7 +280,7 @@ def test_two_edges_into_one_input_is_rejected():
 
 def test_connected_input_with_a_param_is_rejected():
     graph = build(
-        {"src": ("const", {}), "a": ("inc", {"input": 3})},
+        {"src": ("t_const", {}), "a": ("t_inc", {"input": 3})},
         ["src.output -> a.input"],
     )
     with pytest.raises(ValidationError, match="both connected and given as a param"):
@@ -288,19 +288,19 @@ def test_connected_input_with_a_param_is_rejected():
 
 
 def test_edge_to_missing_node_is_reported():
-    graph = build({"a": ("const", {})}, ["a.output -> ghost.input"])
+    graph = build({"a": ("t_const", {})}, ["a.output -> ghost.input"])
     with pytest.raises(ValidationError, match="target node 'ghost' does not exist"):
         graph.validate()
 
 
 def test_type_mismatch_is_reported():
-    @block(category="t", name="stringy", register_globally=False)
+    @block(category="t", name="t_stringy", register_globally=False)
     def stringy(input: str = "x") -> str:
         return input
 
     registry.register(stringy.spec)
     graph = build(
-        {"s": ("stringy", {}), "a": ("inc", {})}, ["s.output -> a.input"]
+        {"s": ("t_stringy", {}), "a": ("t_inc", {})}, ["s.output -> a.input"]
     )
     with pytest.raises(ValidationError, match="type mismatch, str cannot feed int"):
         graph.validate()
@@ -308,7 +308,7 @@ def test_type_mismatch_is_reported():
 
 def test_all_problems_are_reported_at_once():
     """A hand-edited file should not need six runs to find six mistakes."""
-    graph = build({"a": ("add", {"wrong": 1})}, ["a.output -> ghost.input"])
+    graph = build({"a": ("t_add", {"wrong": 1})}, ["a.output -> ghost.input"])
     problems = graph.problems()
     assert len(problems) >= 3
     joined = "\n".join(problems)
@@ -326,7 +326,7 @@ def test_bad_enum_param_is_reported_before_running(real_blocks):
 
 
 def test_layout_referencing_unknown_node_is_reported():
-    graph = build({"a": ("const", {})}, [])
+    graph = build({"a": ("t_const", {})}, [])
     graph.layout["ghost"] = (0.0, 0.0)
     with pytest.raises(ValidationError, match="layout references unknown node 'ghost'"):
         graph.validate()

@@ -1,0 +1,44 @@
+version: 1
+name: motion
+
+# Frame differencing over a video file -- the phase 1 acceptance diagram.
+# It needs what phase 0 could not do: blocks that keep state across sweeps.
+#
+#   video -+-> prev ----+
+#          |            +-> diff -> gray -> mask -+-> motion (pixel count)
+#          +------------+                          +-> show
+#
+# 'prev' is a frame_buffer: it returns the frame from the sweep before, so
+# 'diff' compares consecutive frames. Run it with several sweeps:
+#
+#   pydiedi run tests/fixtures/motion.yaml -n 0
+#
+# -n 0 means "until something stops the run"; video_file raises StopExecution
+# when it reaches the last frame, so this terminates on its own.
+
+nodes:
+  video:  {block: video_file, params: {path: moving_square.avi}}
+  prev:   {block: frame_buffer}
+  diff:   {block: abs_diff}
+  gray:   {block: cvt_color, params: {code: bgr2gray}}
+  mask:   {block: threshold, params: {level: 40}}
+  motion: {block: count_non_zero}
+  show:   {block: preview, params: {title: motion_mask}}
+
+edges:
+  - video.image -> prev.input
+  - video.image -> diff.a
+  - prev.output -> diff.b
+  - diff.output -> gray.input
+  - gray.output -> mask.input
+  - mask.output -> motion.input
+  - mask.output -> show.input
+
+layout:
+  video:  [0, 0]
+  prev:   [160, 80]
+  diff:   [320, 0]
+  gray:   [480, 0]
+  mask:   [640, 0]
+  motion: [800, -60]
+  show:   [800, 60]

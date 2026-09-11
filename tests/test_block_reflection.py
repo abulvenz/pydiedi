@@ -212,12 +212,26 @@ def test_varargs_are_refused():
             return args[0]
 
 
-def test_class_block_is_refused_with_a_forward_looking_message():
-    with pytest.raises(BlockDefinitionError, match="not implemented yet"):
+def test_class_without_call_is_refused():
+    with pytest.raises(BlockDefinitionError, match="needs a __call__ method"):
 
         @block(category="test")
-        class Stateful:
-            pass
+        class NoCall:
+            def run(self, input: Mat) -> Mat:
+                return input
+
+
+def test_class_with_required_init_arguments_is_refused():
+    """Parameters belong on __call__, where they can be connected."""
+    with pytest.raises(BlockDefinitionError, match="__init__ must be callable with no"):
+
+        @block(category="test")
+        class NeedsArgs:
+            def __init__(self, path: str):
+                self.path = path
+
+            def __call__(self) -> int:
+                return 1
 
 
 def test_duplicate_block_name_is_refused():
@@ -252,3 +266,130 @@ def test_wrong_output_count_is_reported():
 
     with pytest.raises(TypeError, match="declares 2 outputs"):
         bad.spec.call({})
+
+
+# -- stateful blocks, declared as classes ---------------------------------
+
+
+def test_class_block_derives_ports_from_call():
+    @block(category="test")
+    class Counter:
+        """Count how often it ran."""
+
+        def __init__(self) -> None:
+            self.n = 0
+
+        def __call__(self, step: int = 1) -> int:
+            self.n += step
+            return self.n
+
+    spec = Counter.spec
+    assert spec.is_stateful is True
+    assert [p.name for p in spec.inputs] == ["step"]
+    assert [p.name for p in spec.outputs] == ["output"]
+    assert spec.doc == "Count how often it ran."
+
+
+def test_class_block_name_is_snake_cased():
+    @block(category="test")
+    class VideoFileReader:
+        def __call__(self) -> int:
+            return 1
+
+    assert VideoFileReader.spec.name == "video_file_reader"
+
+
+def test_class_block_name_can_be_overridden():
+    @block(category="test", name="vid")
+    class VideoFileReader:
+        def __call__(self) -> int:
+            return 1
+
+    assert VideoFileReader.spec.name == "vid"
+
+
+def test_self_is_not_a_port():
+    @block(category="test")
+    class Thing:
+        def __call__(self, value: int = 0) -> int:
+            return value
+
+    assert "self" not in [p.name for p in Thing.spec.inputs]
+
+
+def test_instance_keeps_state_between_calls():
+    @block(category="test")
+    class Accumulator:
+        def __init__(self) -> None:
+            self.total = 0
+
+        def __call__(self, add: int = 1) -> int:
+            self.total += add
+            return self.total
+
+    spec = Accumulator.spec
+    instance = spec.instantiate()
+    assert spec.call({"add": 5}, instance) == {"output": 5}
+    assert spec.call({"add": 3}, instance) == {"output": 8}
+
+
+def test_two_instances_are_independent():
+    @block(category="test")
+    class Accumulator:
+        def __init__(self) -> None:
+            self.total = 0
+
+        def __call__(self, add: int = 1) -> int:
+            self.total += add
+            return self.total
+
+    spec = Accumulator.spec
+    a, b = spec.instantiate(), spec.instantiate()
+    spec.call({"add": 10}, a)
+    assert spec.call({"add": 1}, b) == {"output": 1}
+
+
+def test_stateful_block_without_an_instance_is_a_clear_error():
+    @block(category="test")
+    class Thing:
+        def __call__(self) -> int:
+            return 1
+
+    with pytest.raises(TypeError, match="is stateful and needs an instance"):
+        Thing.spec.call({})
+
+
+def test_close_is_called_when_present():
+    closed: list[bool] = []
+
+    @block(category="test")
+    class Resource:
+        def __call__(self) -> int:
+            return 1
+
+        def close(self) -> None:
+            closed.append(True)
+
+    spec = Resource.spec
+    instance = spec.instantiate()
+    spec.close(instance)
+    assert closed == [True]
+
+
+def test_close_is_optional():
+    @block(category="test")
+    class NoClose:
+        def __call__(self) -> int:
+            return 1
+
+    spec = NoClose.spec
+    spec.close(spec.instantiate())  # must not raise
+
+
+def test_function_block_is_not_stateful():
+    @block(category="test")
+    def plain(value: int = 1) -> int:
+        return value
+
+    assert plain.spec.is_stateful is False
+    assert plain.spec.instantiate() is None

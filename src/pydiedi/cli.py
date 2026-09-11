@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .core import io, registry
 from .core.block import DEFAULT_OUTPUT_NAME
-from .core.executor import CycleError, Executor, NodeExecutionError
+from .core.executor import CycleError, Executor, NodeExecutionError, OnError
 from .core.graph import ValidationError
 from .core.types import CoercionError
 
@@ -70,29 +70,52 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     graph, _ = _load_and_check(args.file)
-    executor = Executor(graph, validate=False)  # type: ignore[arg-type]
 
-    if args.verbose:
-        print(f"order: {' -> '.join(executor.order)}", file=sys.stderr)
+    # A context manager, so a camera or video file is released even when the
+    # run ends by Ctrl-C.
+    with Executor(graph, validate=False, on_error=args.on_error) as executor:  # type: ignore[arg-type]
+        if args.verbose:
+            print(f"order: {' -> '.join(executor.order)}", file=sys.stderr)
+            if executor.stateful_nodes:
+                print(
+                    f"stateful: {', '.join(executor.stateful_nodes)}", file=sys.stderr
+                )
 
-    result = executor.run(iterations=args.iterations, interval=args.interval)
+        try:
+            result = executor.run(iterations=args.iterations, interval=args.interval)
+        except KeyboardInterrupt:
+            print("interrupted", file=sys.stderr)
+            return 130
 
-    for index, preview in enumerate(result.previews):
-        label = preview.title or f"preview {index + 1}"
-        shape = "empty" if preview.image is None else "x".join(map(str, preview.image.shape))
-        print(f"{label}: {shape}")
-        if args.save_previews and preview.image is not None:
-            import cv2
+        for index, preview in enumerate(result.previews):
+            label = preview.title or f"preview {index + 1}"
+            shape = (
+                "empty"
+                if preview.image is None
+                else "x".join(map(str, preview.image.shape))
+            )
+            print(f"{label}: {shape}")
+            if args.save_previews and preview.image is not None:
+                import cv2
 
-            args.save_previews.mkdir(parents=True, exist_ok=True)
-            name = (preview.title or f"preview_{index + 1}").replace("/", "_")
-            out = args.save_previews / f"{name}.png"
-            cv2.imwrite(str(out), preview.image)
-            print(f"  written to {out}")
+                args.save_previews.mkdir(parents=True, exist_ok=True)
+                name = (preview.title or f"preview_{index + 1}").replace("/", "_")
+                out = args.save_previews / f"{name}.png"
+                cv2.imwrite(str(out), preview.image)
+                print(f"  written to {out}")
 
-    if args.verbose:
-        print(f"{len(result.order)} nodes executed", file=sys.stderr)
-    return 0
+        if result.stopped_by:
+            print(f"stopped: {result.stopped_by}", file=sys.stderr)
+
+        for node_id, error in result.errors.items():
+            print(f"error in {node_id}: {error}", file=sys.stderr)
+        if result.skipped:
+            print(f"skipped: {', '.join(result.skipped)}", file=sys.stderr)
+
+        if args.verbose:
+            print(f"{len(result.outputs)} nodes executed", file=sys.stderr)
+
+        return 3 if result.errors else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,6 +152,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="DIR",
         help="write each preview to DIR as a PNG",
+    )
+    run.add_argument(
+        "--on-error",
+        choices=[mode.value for mode in OnError],
+        default=OnError.raise_.value,
+        help=(
+            "raise: stop at the first failing block (default). "
+            "skip: report it, skip what depends on it, keep other branches running"
+        ),
     )
     run.set_defaults(func=_cmd_run)
 
