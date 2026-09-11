@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pydiedi: diagram output written by test fixtures
+tests/fixtures/out/

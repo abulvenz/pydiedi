@@ -1,0 +1,49 @@
+[project]
+name = "pydiedi"
+version = "0.1.0.dev0"
+description = "Visual dataflow editor for image processing. Python port of flodiedi."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Andreas Koch", email = "abulvenz@gmail.com" }]
+keywords = ["dataflow", "opencv", "image-processing", "visual-programming"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python>=4.10",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Phase 3. Deliberately not a hard dependency: the core must stay GUI-free.
+gui = ["PySide6>=6.7"]
+
+[project.scripts]
+pydiedi = "pydiedi.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/abulvenz/pydiedi"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pydiedi"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]

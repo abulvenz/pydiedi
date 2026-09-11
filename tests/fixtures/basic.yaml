@@ -1,0 +1,42 @@
+version: 1
+name: basic
+
+# Phase 0 acceptance diagram. Note the fan-out: gray.output feeds both blur
+# and edges, which is what makes this more than a linear chain.
+#
+#   source -> gray -+-> blur -> mask -+-> compare
+#                   |                 |
+#                   +-> edges --------+
+#
+# Node ids carry the intent. In flodiedi's format every one of these would
+# have been a UUID, and the three Mat-producing filters would have been
+# indistinguishable without cross-referencing.
+
+# Paths are relative to this file, not to the working directory, so the
+# diagram and its data stay portable.
+nodes:
+  source:  {block: imread, params: {path: checkerboard.png}}
+  gray:    {block: cvt_color, params: {code: bgr2gray}}
+  blur:    {block: gaussian_blur, params: {kernel_size: 9, sigma: 2.0}}
+  mask:    {block: threshold, params: {level: 100, type: binary_inv}}
+  edges:   {block: canny, params: {threshold1: 40, threshold2: 120}}
+  compare: {block: side_by_side, params: {title: mask_vs_edges}}
+  save:    {block: imwrite, params: {path: out/basic.png}}
+
+edges:
+  - source.output -> gray.input
+  - gray.output   -> blur.input
+  - gray.output   -> edges.input
+  - blur.output   -> mask.input
+  - mask.output   -> compare.left
+  - edges.output  -> compare.right
+  - mask.output   -> save.input
+
+layout:
+  source:  [0, 0]
+  gray:    [160, 0]
+  blur:    [320, -60]
+  edges:   [320, 60]
+  mask:    [480, -60]
+  compare: [640, 0]
+  save:    [640, -120]
