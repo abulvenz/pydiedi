@@ -25,6 +25,7 @@ from PySide6.QtGui import (
     QFontMetrics,
     QPainter,
     QPainterPath,
+    QPainterPathStroker,
     QPen,
 )
 from PySide6.QtWidgets import (
@@ -36,7 +37,9 @@ from PySide6.QtWidgets import (
     QStyle,
 )
 
+from ..core import registry
 from ..core.block import BlockSpec, Port, PortKind
+from ..core.edit import can_connect
 from ..core.graph import Edge, Graph
 
 __all__ = ["DiagramScene", "DiagramView", "NodeItem", "PortItem", "EdgeItem"]
@@ -58,6 +61,17 @@ COLOUR_SUBTEXT = QColor("#8b93a7")
 COLOUR_EDGE = QColor("#6d7488")
 COLOUR_BACKGROUND = QColor("#22242a")
 COLOUR_GRID = QColor("#282b32")
+COLOUR_INVALID = QColor("#f7768e")
+
+SNAP_RADIUS = 45.0
+"""How far a dragged connection reaches for a compatible port, in scene units.
+
+flodiedi did the same thing and it was one of the better parts of its editor:
+ports are small, and having the line reach for a valid target makes wiring
+much less fiddly than requiring a precise drop.
+"""
+
+MIME_BLOCK = "application/x-pydiedi-block"
 
 # Port colours by type name. flodiedi kept the same idea in a plain-text file
 # (Plugins/portcolors.txt) loaded from a Qt resource.
@@ -87,6 +101,7 @@ class PortItem(QGraphicsItem):
         self.setAcceptHoverEvents(True)
         self.setToolTip(f"{port.name}: {port.type_name}")
         self._hovered = False
+        self._highlighted = False
 
     def boundingRect(self) -> QRectF:  # noqa: N802 - Qt naming
         r = PORT_RADIUS + 2
@@ -96,6 +111,11 @@ class PortItem(QGraphicsItem):
         painter.setRenderHint(QPainter.Antialiasing, True)
         colour = port_colour(self.port.type_name)
         radius = PORT_RADIUS + (1.5 if self._hovered else 0.0)
+        if self._highlighted:
+            # A halo on every port the dragged connection may land on.
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(colour.lighter(140), 1.5))
+            painter.drawEllipse(QPointF(0, 0), radius + 4.0, radius + 4.0)
         painter.setBrush(QBrush(colour))
         painter.setPen(QPen(colour.darker(160), 1.0))
         painter.drawEllipse(QPointF(0, 0), radius, radius)
@@ -104,6 +124,11 @@ class PortItem(QGraphicsItem):
         if self.node.port_is_unsatisfied(self):
             painter.setBrush(QBrush(COLOUR_NODE))
             painter.drawEllipse(QPointF(0, 0), radius - 2.0, radius - 2.0)
+
+    def set_highlighted(self, on: bool) -> None:
+        """Mark this port as a legal target while a connection is dragged."""
+        self._highlighted = on
+        self.update()
 
     def hoverEnterEvent(self, event: object) -> None:  # noqa: N802
         self._hovered = True
@@ -268,6 +293,23 @@ class EdgeItem(QGraphicsPathItem):
         self.setZValue(-1.0)
         self.setPen(QPen(COLOUR_EDGE, 1.8, Qt.SolidLine, Qt.RoundCap))
         self.setToolTip(str(edge))
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        self._hovered = False
+        self.refresh()
+
+    def shape(self) -> QPainterPath:
+        """A fat invisible outline, so a 2px curve can actually be clicked."""
+        stroker = QPainterPathStroker()
+        stroker.setWidth(12.0)
+        return stroker.createStroke(self.path())
+
+    def hoverEnterEvent(self, event: object) -> None:  # noqa: N802
+        self._hovered = True
+        self.refresh()
+
+    def hoverLeaveEvent(self, event: object) -> None:  # noqa: N802
+        self._hovered = False
         self.refresh()
 
     def refresh(self) -> None:
@@ -284,16 +326,72 @@ class EdgeItem(QGraphicsPathItem):
         )
         self.setPath(path)
         colour = port_colour(self.source.port.type_name)
-        self.setPen(QPen(colour.darker(130), 1.8, Qt.SolidLine, Qt.RoundCap))
+        if self.isSelected():
+            self.setPen(QPen(COLOUR_BORDER_SELECTED, 2.8, Qt.SolidLine, Qt.RoundCap))
+        elif self._hovered:
+            self.setPen(QPen(colour.lighter(140), 2.6, Qt.SolidLine, Qt.RoundCap))
+        else:
+            self.setPen(QPen(colour.darker(130), 1.8, Qt.SolidLine, Qt.RoundCap))
+
+    def itemChange(self, change: object, value: object) -> object:  # noqa: N802
+        if change == QGraphicsItem.ItemSelectedHasChanged:
+            self.refresh()
+        return super().itemChange(change, value)  # type: ignore[arg-type]
+
+
+class PendingConnection(QGraphicsPathItem):
+    """The rubber band drawn while a connection is being dragged."""
+
+    def __init__(self, origin: PortItem) -> None:
+        super().__init__()
+        self.origin = origin
+        self.setZValue(100.0)
+        self._valid = False
+        self.setPen(QPen(COLOUR_INVALID, 2.0, Qt.DashLine, Qt.RoundCap))
+
+    def set_endpoint(self, point: QPointF, valid: bool) -> None:
+        self._valid = valid
+        start = self.origin.scenePos()
+        stretch = max(30.0, abs(point.x() - start.x()) * 0.5)
+        if self.origin.port.kind is PortKind.OUT:
+            c1, c2 = QPointF(start.x() + stretch, start.y()), QPointF(point.x() - stretch, point.y())
+        else:
+            c1, c2 = QPointF(start.x() - stretch, start.y()), QPointF(point.x() + stretch, point.y())
+        path = QPainterPath(start)
+        path.cubicTo(c1, c2, point)
+        self.setPath(path)
+        colour = port_colour(self.origin.port.type_name) if valid else COLOUR_INVALID
+        self.setPen(QPen(colour, 2.0, Qt.SolidLine if valid else Qt.DashLine, Qt.RoundCap))
 
 
 class DiagramScene(QGraphicsScene):
-    """Renders a :class:`~pydiedi.core.graph.Graph` and reports edits back."""
+    """Renders a :class:`~pydiedi.core.graph.Graph` and reports edits back.
+
+    The scene never mutates the graph. It reports what the user did, and the
+    window turns that into a command on the
+    :class:`~pydiedi.core.edit.EditSession`, so every change is undoable.
+    """
 
     selection_changed_to = Signal(object)
     """The selected node id, or ``None``."""
-    layout_changed = Signal()
-    """A node was moved; the graph's layout section is now out of date on disk."""
+    node_moved_to = Signal(str, float, float)
+    """A node was dragged. The scene never writes to the graph itself."""
+    layout_computed = Signal(dict)
+    """Positions the scene worked out for nodes that had none."""
+    node_move_finished = Signal()
+    """A drag gesture ended, so the next move starts a new undo step."""
+    connect_requested = Signal(str, str, str, str)
+    """src, src_port, dst, dst_port -- the user dropped a connection."""
+    connection_refused = Signal(str)
+    """Why a dropped connection was not made."""
+    disconnect_requested = Signal(object)
+    """An :class:`~pydiedi.core.graph.Edge` the user wants removed."""
+    delete_requested = Signal(list, list)
+    """node ids and Edges the user wants removed."""
+    block_dropped = Signal(str, float, float)
+    """A block name dragged in from the palette, and where it was dropped."""
+    rename_requested = Signal(str)
+    """The node id the user wants to rename."""
 
     def __init__(self, parent: object | None = None) -> None:
         super().__init__(parent)
@@ -306,6 +404,8 @@ class DiagramScene(QGraphicsScene):
         # exactly as it does for a user drag. Without this guard, merely opening
         # a file would mark the document modified.
         self._building = False
+        self._pending: PendingConnection | None = None
+        self._candidates: list[PortItem] = []
         self.selectionChanged.connect(self._on_selection_changed)
 
     # -- building ---------------------------------------------------------
@@ -335,9 +435,9 @@ class DiagramScene(QGraphicsScene):
                 self.addItem(item)
                 self._nodes[node_id] = item
 
-            missing_layout = [n for n in self._nodes if n not in graph.layout]
-            if missing_layout:
-                self.auto_layout()
+            computed: dict[str, tuple[float, float]] = {}
+            if any(n not in graph.layout for n in self._nodes):
+                computed = self.auto_layout()
 
             for edge in graph.edges:
                 self._add_edge_item(edge)
@@ -348,8 +448,8 @@ class DiagramScene(QGraphicsScene):
 
         # A diagram that arrived without positions has just been given some,
         # which is a change worth saving -- unlike merely opening one.
-        if missing_layout:
-            self.layout_changed.emit()
+        if computed:
+            self.layout_computed.emit(computed)
 
     def tighten_scene_rect(self, margin: float = 400.0) -> None:
         """Keep the scrollable area related to the content.
@@ -376,8 +476,12 @@ class DiagramScene(QGraphicsScene):
         self.addItem(item)
         self._edges.append(item)
 
-    def auto_layout(self) -> None:
-        """Place nodes in dependency columns.
+    def auto_layout(self) -> dict[str, tuple[float, float]]:
+        """Place nodes in dependency columns, returning the new positions.
+
+        The scene applies them to its items but never writes them into the
+        graph: the caller turns the result into a command, so auto-layout is
+        one undo step like any other edit.
 
         flodiedi shelled out to Graphviz for this, through a wrapper around
         ``libgraph`` -- a library Graphviz removed in 2012, which is one of the
@@ -385,7 +489,7 @@ class DiagramScene(QGraphicsScene):
         needs no dependency and is adequate for a dataflow graph.
         """
         if self.graph is None:
-            return
+            return {}
         depth: dict[str, int] = {}
         for node_id in self._topological_ids():
             incoming = self.graph.incoming(node_id)
@@ -399,19 +503,23 @@ class DiagramScene(QGraphicsScene):
         for node_id, column in sorted(depth.items(), key=lambda kv: (kv[1], kv[0])):
             columns.setdefault(column, []).append(node_id)
 
-        for column, ids in columns.items():
-            for row, node_id in enumerate(ids):
-                item = self._nodes.get(node_id)
-                if item is None:
-                    continue
-                x = column * (NODE_WIDTH + 90.0)
-                y = row * 140.0 - (len(ids) - 1) * 70.0
-                item.setPos(QPointF(x, y))
-                if self.graph is not None:
-                    self.graph.layout[node_id] = (x, y)
+        computed: dict[str, tuple[float, float]] = {}
+        was_building, self._building = self._building, True
+        try:
+            for column, ids in columns.items():
+                for row, node_id in enumerate(ids):
+                    item = self._nodes.get(node_id)
+                    if item is None:
+                        continue
+                    x = column * (NODE_WIDTH + 90.0)
+                    y = row * 140.0 - (len(ids) - 1) * 70.0
+                    item.setPos(QPointF(x, y))
+                    computed[node_id] = (x, y)
+        finally:
+            self._building = was_building
         self.refresh_edges()
-        if not self._building:
-            self.layout_changed.emit()
+        self.tighten_scene_rect()
+        return computed
 
     def _topological_ids(self) -> list[str]:
         from ..core.executor import CycleError, topological_order
@@ -445,11 +553,9 @@ class DiagramScene(QGraphicsScene):
             edge.refresh()
 
     def node_moved(self, node_id: str, position: QPointF) -> None:
-        if self.graph is not None:
-            self.graph.layout[node_id] = (position.x(), position.y())
         self.refresh_edges()
         if not self._building:
-            self.layout_changed.emit()
+            self.node_moved_to.emit(node_id, position.x(), position.y())
 
     def set_errors(self, errors: dict[str, str]) -> None:
         """Colour failing nodes. The editor's equivalent of flodiedi's red block."""
@@ -468,6 +574,239 @@ class DiagramScene(QGraphicsScene):
         self.clearSelection()
         if node_id and node_id in self._nodes:
             self._nodes[node_id].setSelected(True)
+
+    def selected_node_ids(self) -> list[str]:
+        return [i.node_id for i in self.selectedItems() if isinstance(i, NodeItem)]
+
+    # -- incremental updates ----------------------------------------------
+    #
+    # Rebuilding the whole scene after every edit would be correct but would
+    # drop the selection and flicker. These keep the view in step with single
+    # changes; rebuild() handles the rest.
+
+    def add_node_item(self, node_id: str) -> NodeItem | None:
+        if self.graph is None or node_id in self._nodes:
+            return None
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            return None
+        try:
+            spec = registry.get(node.block)
+        except registry.UnknownBlockError:
+            return None
+        # Guarded, because setPos() is reported as ItemPositionHasChanged
+        # exactly as a user drag is. Without this, adding a block would also
+        # record a move, and one palette click would cost two undo steps.
+        was_building, self._building = self._building, True
+        try:
+            item = NodeItem(node_id, spec, self)
+            position = self.graph.layout.get(node_id)
+            if position is not None:
+                item.setPos(QPointF(*position))
+            self.addItem(item)
+        finally:
+            self._building = was_building
+        self._nodes[node_id] = item
+        self.tighten_scene_rect()
+        return item
+
+    def remove_node_item(self, node_id: str) -> None:
+        for edge_item in [
+            e for e in self._edges if e.edge.src == node_id or e.edge.dst == node_id
+        ]:
+            self._remove_edge_item(edge_item)
+        item = self._nodes.pop(node_id, None)
+        if item is not None:
+            self.removeItem(item)
+
+    def add_edge_item(self, edge: Edge) -> None:
+        self._connected.add((edge.dst, edge.dst_port))
+        self._add_edge_item(edge)
+        self._refresh_ports()
+
+    def remove_edge_item(self, edge: Edge) -> None:
+        for item in [e for e in self._edges if e.edge == edge]:
+            self._remove_edge_item(item)
+        self._connected.discard((edge.dst, edge.dst_port))
+        self._refresh_ports()
+
+    def _remove_edge_item(self, item: EdgeItem) -> None:
+        self.removeItem(item)
+        self._edges.remove(item)
+
+    def _refresh_ports(self) -> None:
+        """Redraw ports, whose hollow/filled state depends on connections."""
+        for node in self._nodes.values():
+            for child in node.childItems():
+                child.update()
+
+    def rebuild(self, specs: dict[str, BlockSpec]) -> None:
+        """Re-render the current graph, keeping the selection where possible."""
+        if self.graph is None:
+            return
+        selected = [i.node_id for i in self.selectedItems() if isinstance(i, NodeItem)]
+        self.set_graph(self.graph, specs)
+        for node_id in selected:
+            if node_id in self._nodes:
+                self._nodes[node_id].setSelected(True)
+
+    # -- interaction ------------------------------------------------------
+
+    def _port_at(self, point: QPointF) -> PortItem | None:
+        for item in self.items(point):
+            if isinstance(item, PortItem):
+                return item
+        return None
+
+    def _snap_target(self, point: QPointF) -> PortItem | None:
+        """The nearest compatible port within :data:`SNAP_RADIUS`."""
+        best: PortItem | None = None
+        best_distance = SNAP_RADIUS
+        for candidate in self._candidates:
+            delta = candidate.scenePos() - point
+            distance = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+            if distance < best_distance:
+                best, best_distance = candidate, distance
+        return best
+
+    def _collect_candidates(self, origin: PortItem) -> list[PortItem]:
+        """Every port the dragged connection could legally land on."""
+        if self.graph is None:
+            return []
+        origin_node = origin.node.node_id
+        candidates: list[PortItem] = []
+        for node_id, node_item in self._nodes.items():
+            if node_id == origin_node:
+                continue
+            for child in node_item.childItems():
+                if not isinstance(child, PortItem) or child.port.kind is origin.port.kind:
+                    continue
+                src, dst = (origin, child) if origin.port.kind is PortKind.OUT else (child, origin)
+                if can_connect(
+                    self.graph,
+                    src.node.node_id,
+                    src.port.name,
+                    dst.node.node_id,
+                    dst.port.name,
+                ) is None:
+                    candidates.append(child)
+        return candidates
+
+    def mousePressEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
+        if event.button() == Qt.LeftButton:  # type: ignore[attr-defined]
+            port = self._port_at(event.scenePos())  # type: ignore[attr-defined]
+            if port is not None:
+                self._pending = PendingConnection(port)
+                self._candidates = self._collect_candidates(port)
+                for candidate in self._candidates:
+                    candidate.set_highlighted(True)
+                self.addItem(self._pending)
+                self._pending.set_endpoint(event.scenePos(), False)  # type: ignore[attr-defined]
+                event.accept()  # type: ignore[attr-defined]
+                return
+        super().mousePressEvent(event)  # type: ignore[arg-type]
+
+    def mouseMoveEvent(self, event: object) -> None:  # noqa: N802
+        if self._pending is not None:
+            point = event.scenePos()  # type: ignore[attr-defined]
+            target = self._snap_target(point)
+            self._pending.set_endpoint(
+                target.scenePos() if target is not None else point, target is not None
+            )
+            event.accept()  # type: ignore[attr-defined]
+            return
+        super().mouseMoveEvent(event)  # type: ignore[arg-type]
+
+    def mouseReleaseEvent(self, event: object) -> None:  # noqa: N802
+        if self._pending is not None:
+            origin = self._pending.origin
+            point = event.scenePos()  # type: ignore[attr-defined]
+            target = self._snap_target(point) or self._port_at(point)
+            self._end_pending()
+            if target is not None and target is not origin:
+                self._request_connection(origin, target)
+            event.accept()  # type: ignore[attr-defined]
+            return
+        super().mouseReleaseEvent(event)  # type: ignore[arg-type]
+        # A drag of one or more nodes has ended; close the undo merge window so
+        # the next drag is a separate step.
+        if event.button() == Qt.LeftButton:  # type: ignore[attr-defined]
+            self.node_move_finished.emit()
+
+    def _end_pending(self) -> None:
+        for candidate in self._candidates:
+            candidate.set_highlighted(False)
+        self._candidates = []
+        if self._pending is not None:
+            self.removeItem(self._pending)
+            self._pending = None
+
+    def _request_connection(self, origin: PortItem, target: PortItem) -> None:
+        if origin.port.kind is target.port.kind:
+            self.connection_refused.emit("connections run from an output to an input")
+            return
+        source, sink = (
+            (origin, target) if origin.port.kind is PortKind.OUT else (target, origin)
+        )
+        if self.graph is None:
+            return
+        reason = can_connect(
+            self.graph,
+            source.node.node_id,
+            source.port.name,
+            sink.node.node_id,
+            sink.port.name,
+        )
+        if reason is not None:
+            self.connection_refused.emit(reason)
+            return
+        self.connect_requested.emit(
+            source.node.node_id, source.port.name, sink.node.node_id, sink.port.name
+        )
+
+    def keyPressEvent(self, event: object) -> None:  # noqa: N802
+        key = event.key()  # type: ignore[attr-defined]
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):
+            self._request_delete()
+            event.accept()  # type: ignore[attr-defined]
+            return
+        if key == Qt.Key_F2:
+            nodes = [i for i in self.selectedItems() if isinstance(i, NodeItem)]
+            if len(nodes) == 1:
+                self.rename_requested.emit(nodes[0].node_id)
+                event.accept()  # type: ignore[attr-defined]
+                return
+        super().keyPressEvent(event)  # type: ignore[arg-type]
+
+    def _request_delete(self) -> None:
+        node_ids = [i.node_id for i in self.selectedItems() if isinstance(i, NodeItem)]
+        edges = [i.edge for i in self.selectedItems() if isinstance(i, EdgeItem)]
+        if node_ids or edges:
+            self.delete_requested.emit(node_ids, edges)
+
+    # -- drag and drop from the palette -----------------------------------
+
+    def dragEnterEvent(self, event: object) -> None:  # noqa: N802
+        if event.mimeData().hasFormat(MIME_BLOCK):  # type: ignore[attr-defined]
+            event.acceptProposedAction()  # type: ignore[attr-defined]
+            return
+        super().dragEnterEvent(event)  # type: ignore[arg-type]
+
+    def dragMoveEvent(self, event: object) -> None:  # noqa: N802
+        if event.mimeData().hasFormat(MIME_BLOCK):  # type: ignore[attr-defined]
+            event.acceptProposedAction()  # type: ignore[attr-defined]
+            return
+        super().dragMoveEvent(event)  # type: ignore[arg-type]
+
+    def dropEvent(self, event: object) -> None:  # noqa: N802
+        data = event.mimeData()  # type: ignore[attr-defined]
+        if data.hasFormat(MIME_BLOCK):
+            name = bytes(data.data(MIME_BLOCK)).decode("utf-8")
+            point = event.scenePos()  # type: ignore[attr-defined]
+            self.block_dropped.emit(name, point.x(), point.y())
+            event.acceptProposedAction()  # type: ignore[attr-defined]
+            return
+        super().dropEvent(event)  # type: ignore[arg-type]
 
 
 class DiagramView(QGraphicsView):

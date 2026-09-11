@@ -54,7 +54,9 @@ def window(qapp, real_blocks):
 
     yield make
     for editor in windows:
-        editor._dirty = False  # do not pop a modal save prompt during teardown
+        # Mark saved rather than poking a flag: _confirm_discard asks the
+        # session, and a modal save prompt in teardown would hang the suite.
+        editor.session.mark_saved()
         editor.close()
 
 
@@ -359,18 +361,38 @@ def test_auto_layout_survives_a_cycle(qapp, real_blocks):
     assert len(scene._nodes) == 2
 
 
-def test_moving_a_node_updates_the_layout(qapp, real_blocks):
+def test_moving_a_node_reports_it_without_touching_the_graph(qapp, real_blocks):
+    """The scene renders and reports; the window turns that into a command.
+
+    If the scene wrote positions itself, moving a node would not be undoable.
+    """
+    from pydiedi.core import registry
+
+    graph = io.load(MOTION)
+    before = dict(graph.layout)
+    specs = {n.id: registry.get(n.block) for n in graph.nodes.values()}
+    scene = DiagramScene()
+    scene.set_graph(graph, specs)
+
+    moves: list[tuple[str, float, float]] = []
+    scene.node_moved_to.connect(lambda *args: moves.append(args))
+    scene._nodes["video"].setPos(123.0, 456.0)
+
+    assert moves == [("video", 123.0, 456.0)]
+    assert graph.layout == before, "the scene must not write to the graph"
+
+
+def test_building_the_scene_reports_no_moves(qapp, real_blocks):
+    """setPos() during construction looks identical to a drag, to Qt."""
     from pydiedi.core import registry
 
     graph = io.load(MOTION)
     specs = {n.id: registry.get(n.block) for n in graph.nodes.values()}
     scene = DiagramScene()
-    changes: list[int] = []
+    moves: list[tuple] = []
+    scene.node_moved_to.connect(lambda *args: moves.append(args))
     scene.set_graph(graph, specs)
-    scene.layout_changed.connect(lambda: changes.append(1))
-    scene._nodes["video"].setPos(123.0, 456.0)
-    assert graph.layout["video"] == (123.0, 456.0)
-    assert changes, "moving a node must report a change"
+    assert moves == []
 
 
 def test_errors_colour_the_node(qapp, real_blocks):
@@ -407,7 +429,7 @@ def test_node_item_never_owns_a_model_object(qapp, real_blocks):
 def test_opening_a_diagram_does_not_mark_it_modified(window):
     """setPos() during construction looks exactly like a user drag to Qt."""
     editor = window(MOTION)
-    assert editor._dirty is False
+    assert editor.session.modified is False
     assert not editor.windowTitle().startswith("*")
 
 
@@ -425,15 +447,15 @@ def test_window_opens_the_basic_diagram_too(window):
 def test_new_diagram_is_empty_and_clean(window):
     editor = window(MOTION)
     editor.new_diagram()
-    assert editor._graph.nodes == {}
-    assert editor._dirty is False
+    assert editor.session.graph.nodes == {}
+    assert editor.session.modified is False
 
 
 def test_editing_a_parameter_marks_the_document_modified(window):
     editor = window(MOTION)
     editor._on_parameter_changed("mask", "level", 77)
-    assert editor._graph.nodes["mask"].params["level"] == 77
-    assert editor._dirty is True
+    assert editor.session.graph.nodes["mask"].params["level"] == 77
+    assert editor.session.modified is True
     assert editor.windowTitle().startswith("*")
 
 
@@ -441,11 +463,11 @@ def test_saving_writes_a_round_trippable_file(window, tmp_path):
     editor = window(MOTION)
     target = tmp_path / "out.yaml"
     editor._path = target
-    editor._graph.base_dir = target.parent
+    editor.session.graph.base_dir = target.parent
     assert editor.save() is True
-    assert editor._dirty is False
+    assert editor.session.modified is False
     reloaded = io.load(target)
-    assert set(reloaded.nodes) == set(editor._graph.nodes)
+    assert set(reloaded.nodes) == set(editor.session.graph.nodes)
 
 
 def test_parameter_editor_offers_enum_choices(window):
@@ -501,10 +523,10 @@ def test_running_from_the_window_shows_previews(qapp, window):
 def test_window_closes_while_a_run_is_in_progress(qapp, window):
     """flodiedi deleted a running QThread here, with the wait() commented out."""
     editor = window(MOTION)
-    editor._graph.nodes["video"].params["loop"] = True
+    editor.session.graph.nodes["video"].params["loop"] = True
     editor.run_continuous()
     assert spin(qapp, lambda: editor._worker is not None and editor._worker.isRunning())
-    editor._dirty = False
+    editor.session.mark_saved()
     editor.close()
     assert editor._worker is None
 
@@ -666,3 +688,261 @@ def scene_port_kind_in():
     from pydiedi.core.block import PortKind
 
     return PortKind.IN
+
+
+# -- editing the graph ----------------------------------------------------
+
+
+def test_double_clicking_the_palette_adds_a_block(window):
+    editor = window(None)
+    editor._on_palette_activated("canny")
+    assert "canny" in editor.session.graph.nodes
+    assert "canny" in editor.scene._nodes
+    assert editor.session.modified
+
+
+def test_dropping_a_block_places_it_where_it_was_dropped(window):
+    editor = window(None)
+    editor._on_block_dropped("canny", 300.0, 200.0)
+    x, y = editor.session.graph.layout["canny"]
+    assert (x, y) == (225.0, 180.0)  # centred on the drop point
+
+
+def test_adding_the_same_block_twice_gives_distinct_ids(window):
+    editor = window(None)
+    editor._on_palette_activated("canny")
+    editor._on_palette_activated("canny")
+    assert set(editor.session.graph.nodes) == {"canny", "canny_2"}
+
+
+def test_a_new_block_is_selected_so_its_parameters_show(window):
+    editor = window(None)
+    editor._on_palette_activated("threshold")
+    assert editor.scene.selected_node_ids() == ["threshold"]
+
+
+def test_connecting_two_blocks(window):
+    editor = window(None)
+    editor._on_palette_activated("imread")
+    editor._on_palette_activated("canny")
+    editor._on_connect_requested("imread", "output", "canny", "input")
+    assert [str(e) for e in editor.session.graph.edges] == [
+        "imread.output -> canny.input"
+    ]
+    assert len(editor.scene._edges) == 1
+
+
+def test_a_refused_connection_is_explained_and_not_made(window):
+    editor = window(None)
+    editor._on_palette_activated("imread")
+    editor._on_palette_activated("canny")
+    editor._on_connect_requested("imread", "output", "canny", "input")
+    editor._on_connect_requested("imread", "output", "canny", "input")
+    assert len(editor.session.graph.edges) == 1
+    assert "already connected" in editor.log.toPlainText()
+
+
+def test_deleting_a_node_takes_its_edges(window):
+    editor = window(MOTION)
+    editor._on_delete_requested(["gray"], [])
+    assert "gray" not in editor.session.graph.nodes
+    assert all(e.src != "gray" and e.dst != "gray" for e in editor.session.graph.edges)
+    assert "gray" not in editor.scene._nodes
+
+
+def test_deleting_an_edge(window):
+    editor = window(MOTION)
+    edge = next(e for e in editor.session.graph.edges if e.dst == "mask")
+    editor._on_delete_requested([], [edge])
+    assert edge not in editor.session.graph.edges
+    assert len(editor.scene._edges) == 6
+
+
+def test_deleting_a_node_and_its_edge_together_does_not_double_remove(window):
+    """Selecting a node and one of its edges is an easy thing to do."""
+    editor = window(MOTION)
+    edge = next(e for e in editor.session.graph.edges if e.dst == "gray")
+    editor._on_delete_requested(["gray"], [edge])
+    assert "gray" not in editor.session.graph.nodes
+    assert "refused" not in editor.log.toPlainText()
+
+
+def test_undo_restores_a_deleted_node_with_its_edges(window):
+    editor = window(MOTION)
+    before_nodes = set(editor.session.graph.nodes)
+    before_edges = {str(e) for e in editor.session.graph.edges}
+    editor._on_delete_requested(["gray"], [])
+    editor.undo()
+    assert set(editor.session.graph.nodes) == before_nodes
+    assert {str(e) for e in editor.session.graph.edges} == before_edges
+    assert set(editor.scene._nodes) == before_nodes
+    assert len(editor.scene._edges) == len(before_edges)
+
+
+def test_undo_and_redo_a_connection(window):
+    editor = window(None)
+    editor._on_palette_activated("imread")
+    editor._on_palette_activated("canny")
+    editor._on_connect_requested("imread", "output", "canny", "input")
+    editor.undo()
+    assert editor.session.graph.edges == []
+    assert editor.scene._edges == []
+    editor.redo()
+    assert len(editor.session.graph.edges) == 1
+    assert len(editor.scene._edges) == 1
+
+
+def test_undo_actions_reflect_the_history(window):
+    editor = window(None)
+    assert not editor.action_undo.isEnabled()
+    editor._on_palette_activated("canny")
+    assert editor.action_undo.isEnabled()
+    assert "add canny" in editor.action_undo.text()
+    editor.undo()
+    assert not editor.action_undo.isEnabled()
+    assert editor.action_redo.isEnabled()
+    assert "add canny" in editor.action_redo.text()
+
+
+def test_a_drag_is_one_undo_step(window):
+    editor = window(MOTION)
+    start = editor.session.graph.layout["gray"]
+    for x in range(10):
+        editor._on_node_moved("gray", 500.0 + x, 300.0)
+    editor.scene.node_move_finished.emit()
+    editor.undo()
+    assert editor.session.graph.layout["gray"] == start
+
+
+def test_two_drags_are_two_undo_steps(window):
+    editor = window(MOTION)
+    editor._on_node_moved("gray", 10.0, 10.0)
+    editor.scene.node_move_finished.emit()
+    editor._on_node_moved("gray", 20.0, 20.0)
+    editor.scene.node_move_finished.emit()
+    editor.undo()
+    assert editor.session.graph.layout["gray"] == (10.0, 10.0)
+
+
+def test_undoing_back_to_the_saved_state_clears_the_asterisk(window, tmp_path):
+    editor = window(MOTION)
+    target = tmp_path / "d.yaml"
+    editor._path = target
+    editor.session.graph.base_dir = tmp_path
+    editor.save()
+    assert not editor.windowTitle().startswith("*")
+
+    editor._on_palette_activated("canny")
+    assert editor.windowTitle().startswith("*")
+    editor.undo()
+    assert not editor.windowTitle().startswith("*")
+
+
+def test_renaming_updates_edges_and_the_scene(window, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("luminance", True))
+    editor = window(MOTION)
+    editor._on_rename_requested("gray")
+    assert "luminance" in editor.session.graph.nodes
+    assert "luminance" in editor.scene._nodes
+    assert any(e.src == "luminance" for e in editor.session.graph.edges)
+    assert len(editor.scene._edges) == 7
+
+
+def test_cancelling_a_rename_changes_nothing(window, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("", False))
+    editor = window(MOTION)
+    editor._on_rename_requested("gray")
+    assert "gray" in editor.session.graph.nodes
+
+
+def test_auto_layout_is_one_undo_step(window):
+    editor = window(MOTION)
+    before = dict(editor.session.graph.layout)
+    editor.auto_layout()
+    assert editor.session.graph.layout != before
+    editor.undo()
+    assert editor.session.graph.layout == before
+
+
+def test_an_edited_diagram_saves_and_reloads(window, tmp_path):
+    editor = window(None)
+    editor._on_palette_activated("imread")
+    editor._on_palette_activated("canny")
+    editor._on_connect_requested("imread", "output", "canny", "input")
+    editor._on_parameter_changed("imread", "path", "x.png")
+
+    target = tmp_path / "d.yaml"
+    editor._path = target
+    editor.session.graph.base_dir = tmp_path
+    assert editor.save()
+
+    reloaded = io.load(target)
+    assert set(reloaded.nodes) == {"imread", "canny"}
+    assert [str(e) for e in reloaded.edges] == ["imread.output -> canny.input"]
+    assert reloaded.nodes["imread"].params["path"] == "x.png"
+
+
+def test_status_bar_follows_edits(window):
+    editor = window(None)
+    editor._on_palette_activated("imread")
+    editor._on_palette_activated("canny")
+    editor._on_connect_requested("imread", "output", "canny", "input")
+    assert "2 nodes, 1 edges" in editor._status.text()
+
+
+def test_snap_candidates_exclude_incompatible_and_own_ports(qapp, window):
+    """The drag highlights only ports it could legally land on."""
+    editor = window(None)
+    editor._on_palette_activated("imread")
+    editor._on_palette_activated("canny")
+    editor._on_palette_activated("count_non_zero")
+
+    imread_out = editor.scene._nodes["imread"].port_item("output", _kind_out())
+    candidates = editor.scene._collect_candidates(imread_out)
+    names = {(c.node.node_id, c.port.name) for c in candidates}
+
+    assert ("canny", "input") in names, "a Mat input should be a candidate"
+    assert ("count_non_zero", "input") in names
+    assert all(node != "imread" for node, _ in names), "not its own ports"
+    assert all(
+        editor.scene._nodes[n].port_item(p, _kind_out()) is None for n, p in names
+    ), "only inputs"
+
+
+def test_snap_candidates_exclude_an_occupied_input(qapp, window):
+    editor = window(None)
+    editor._on_palette_activated("imread")
+    editor._on_palette_activated("imread")
+    editor._on_palette_activated("canny")
+    editor._on_connect_requested("imread", "output", "canny", "input")
+
+    other_out = editor.scene._nodes["imread_2"].port_item("output", _kind_out())
+    names = {
+        (c.node.node_id, c.port.name)
+        for c in editor.scene._collect_candidates(other_out)
+    }
+    assert ("canny", "input") not in names
+
+
+def test_snap_candidates_exclude_ports_that_would_make_a_cycle(qapp, window):
+    editor = window(None)
+    editor._on_palette_activated("gaussian_blur")
+    editor._on_palette_activated("canny")
+    editor._on_connect_requested("gaussian_blur", "output", "canny", "input")
+
+    canny_out = editor.scene._nodes["canny"].port_item("output", _kind_out())
+    names = {
+        (c.node.node_id, c.port.name)
+        for c in editor.scene._collect_candidates(canny_out)
+    }
+    assert ("gaussian_blur", "input") not in names
+
+
+def _kind_out():
+    from pydiedi.core.block import PortKind
+
+    return PortKind.OUT

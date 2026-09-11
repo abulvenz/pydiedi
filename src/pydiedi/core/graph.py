@@ -57,7 +57,14 @@ class Edge:
     src_port: str
     dst: str
     dst_port: str
-    line: int | None = None
+    line: int | None = field(default=None, compare=False)
+    """Source line in the YAML file, for error messages.
+
+    Excluded from equality and hashing on purpose: it is metadata about where
+    an edge was written down, not part of what the edge *is*. Two edges between
+    the same ports are the same edge whether one came from a file and the other
+    from the editor.
+    """
 
     def __str__(self) -> str:
         return f"{self.src}.{self.src_port} -> {self.dst}.{self.dst_port}"

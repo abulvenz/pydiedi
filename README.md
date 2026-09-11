@@ -6,8 +6,7 @@ Visual dataflow for image processing: build a graph of processing blocks, run it
 see what comes out. flodiedi was written 2010–2013 in C++/Qt4; this is the same
 idea in Python, where most of its machinery turns out to be unnecessary.
 
-**Status: phase 3 — headless runner and a Qt editor that views and runs diagrams.
-Editing the graph itself (adding blocks, drawing connections) is the next step.**
+**Status: a headless runner and a Qt editor that builds, edits and runs diagrams.**
 
 ## Why a rewrite rather than a port
 
@@ -55,12 +54,21 @@ uv run pydiedi edit tests/fixtures/motion.yaml
 
 ![the editor running a frame-differencing diagram](doc/editor.png)
 
-It opens a diagram, shows the graph, runs it and displays whatever the
-`preview` blocks produce. Failing nodes turn red and name the problem; a
-required input with no value is drawn as a hollow port, so a diagram that
-cannot run says so before you run it. Parameters on the right are generated
-from the block's type hints — a combo box for an enum, a file chooser for a
-`Path`, and an input fed by a connection is shown disabled.
+Drag a block from the palette (or double-click it), drag from one port to
+another to connect them, `Del` to remove, `F2` to rename, `Ctrl+Z` to undo.
+Failing nodes turn red and name the problem; a required input with no value is
+drawn as a hollow port, so a diagram that cannot run says so before you run it.
+Parameters on the right are generated from the block's type hints — a combo box
+for an enum, a file chooser for a `Path`, and an input fed by a connection is
+shown disabled.
+
+While a connection is being dragged, every port it could legally land on is
+haloed and the line reaches for the nearest one. flodiedi did the same and it
+was one of the better parts of its editor: ports are small, and having the line
+snap makes wiring far less fiddly than demanding a precise drop. What it does
+*not* do is accept the connection and deal with the consequences later — the
+candidates exclude occupied inputs, incompatible types and anything that would
+close a cycle, and a refused drop says why in the status bar.
 
 The view keeps the whole diagram in frame until you zoom or pan. That is not
 cosmetic: a requested window size is only a request, and a tiling window
@@ -139,7 +147,7 @@ result is visible in its own repository: `loadPointCloudplugin` shipped with
 
 ```
 pydiedi/
-├── core/          no Qt, no cv2 — graph, executor, blocks, file format
+├── core/          no Qt, no cv2 — graph, executor, blocks, edit commands, file format
 ├── blocks/        the block library; cv2 and numpy, never a GUI toolkit
 │   ├── sources.py     camera, video_file, frame_buffer  (stateful)
 │   ├── imageio.py     imread, imwrite
@@ -173,6 +181,24 @@ Qt4, fatal in Qt5 and Qt6.
 subprocess import that inspects `sys.modules`, an AST scan that also catches
 lazy or unreachable imports, and a check that `import pydiedi.gui` itself does
 not pull in Qt — so `pydiedi run` keeps working in an install without the extra.
+
+### Editing
+
+Every change goes through a command in `core/edit.py` — `AddNode`, `Connect`,
+`RenameNode` and so on — and nothing mutates a `Graph` directly. Undo is
+therefore a property of the design rather than a feature bolted on, and the
+part of an editor most worth testing is testable without opening a window:
+`tests/test_edit.py` imports no Qt.
+
+The commands live in `core` for the same reason the block library does: a
+second renderer needs exactly these operations, and putting them behind Qt
+would mean writing them twice.
+
+Two details that only show up once you use it. A drag arrives as a stream of
+positions and a spin box emits a value per keystroke, so `MoveNode` and
+`SetParam` merge with the command before them — one undo step per gesture, not
+per event. And `modified` is undo-aware: undoing back to the last save clears
+the asterisk instead of leaving the document dirty forever.
 
 ### Threading
 
@@ -254,14 +280,13 @@ red node does not halt the diagram.
 ## Test
 
 ```sh
-uv run pytest            # 208 tests, GUI included (offscreen)
+uv run pytest            # 284 tests, GUI included (offscreen)
 ```
 
 ## Known limitations
 
-- **The editor views and runs; it does not yet edit the graph.** Moving nodes,
-  auto-layout and parameter editing work and save. Adding a block from the
-  palette and drawing a connection are the next step.
+- **No copy and paste, and no multi-select drag.** Single nodes and edges can
+  be added, moved, renamed and deleted.
 - **Execution is serial.** One sweep in topological order, as in flodiedi.
   Running independent branches in parallel is feasible — `cv2` releases the
   GIL — but correctness first.

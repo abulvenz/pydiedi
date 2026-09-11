@@ -14,7 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QFont, QFontMetrics, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -35,23 +36,45 @@ from PySide6.QtWidgets import (
 from ..core import registry
 from ..core.block import BlockSpec, Port
 from ..core.graph import Graph
+from .canvas import MIME_BLOCK
 
 __all__ = ["BlockPalette", "ParameterEditor"]
 
 
 class BlockPalette(QTreeWidget):
-    """Every registered block, grouped by category."""
+    """Every registered block, grouped by category.
+
+    A block reaches the canvas either by being dragged onto it or by being
+    double-clicked, which drops it in the middle of the view. Both exist
+    because dragging is discoverable and double-clicking is faster.
+    """
 
     block_activated = Signal(str)
-    """A block name the user chose to add."""
+    """A block name the user chose to add, without saying where."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setHeaderHidden(True)
         self.setIndentation(12)
         self.setAlternatingRowColors(False)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QTreeWidget.DragOnly)
         self.itemDoubleClicked.connect(self._on_activated)
         self.reload()
+
+    def block_name_of(self, item: QTreeWidgetItem | None) -> str | None:
+        return item.data(0, Qt.UserRole) if item is not None else None
+
+    def startDrag(self, actions: object) -> None:  # noqa: N802 - Qt naming
+        name = self.block_name_of(self.currentItem())
+        if not name:
+            return
+        payload = QMimeData()
+        payload.setData(MIME_BLOCK, name.encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(payload)
+        drag.setPixmap(_drag_pixmap(name))
+        drag.exec(Qt.CopyAction)
 
     def reload(self) -> None:
         self.clear()
@@ -73,6 +96,25 @@ class BlockPalette(QTreeWidget):
         name = item.data(0, Qt.UserRole)
         if name:
             self.block_activated.emit(name)
+
+
+def _drag_pixmap(name: str) -> QPixmap:
+    """A small label that follows the cursor, so the drag is visible."""
+    font = QFont()
+    font.setPointSizeF(9.0)
+    width = QFontMetrics(font).horizontalAdvance(name) + 16
+    pixmap = QPixmap(width, 24)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setBrush(QColor("#3c4250"))
+    painter.setPen(QColor("#7aa2f7"))
+    painter.drawRoundedRect(0, 0, width - 1, 23, 4, 4)
+    painter.setFont(font)
+    painter.setPen(QColor("#d5d8e0"))
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, name)
+    painter.end()
+    return pixmap
 
 
 def _spec_tooltip(spec: BlockSpec) -> str:

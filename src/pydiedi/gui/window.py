@@ -19,6 +19,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -30,8 +31,9 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core import io, registry
 from ..core.block import BlockSpec
+from ..core.edit import EditError, EditSession
 from ..core.executor import CycleError, OnError, topological_order
-from ..core.graph import Graph, ValidationError
+from ..core.graph import Edge, Graph, ValidationError
 from .canvas import DiagramScene, DiagramView
 from .palette import BlockPalette, ParameterEditor
 from .preview import PreviewPanel
@@ -51,9 +53,10 @@ class EditorWindow(QMainWindow):
         super().__init__()
         registry.discover()
 
-        self._graph: Graph = Graph(name="untitled")
+        # Every change goes through the session, so everything is undoable
+        # and 'modified' is undo-aware rather than a flag that latches on.
+        self.session = EditSession(Graph(name="untitled"))
         self._path: Path | None = None
-        self._dirty = False
         self._worker: ExecutionWorker | None = None
 
         self.scene = DiagramScene(self)
@@ -72,7 +75,14 @@ class EditorWindow(QMainWindow):
         self._build_statusbar()
 
         self.scene.selection_changed_to.connect(self.parameters.show_node)
-        self.scene.layout_changed.connect(self._mark_dirty)
+        self.scene.node_moved_to.connect(self._on_node_moved)
+        self.scene.layout_computed.connect(self._on_layout_computed)
+        self.scene.node_move_finished.connect(self.session.end_gesture)
+        self.scene.connect_requested.connect(self._on_connect_requested)
+        self.scene.connection_refused.connect(self._on_connection_refused)
+        self.scene.delete_requested.connect(self._on_delete_requested)
+        self.scene.rename_requested.connect(self._on_rename_requested)
+        self.scene.block_dropped.connect(self._on_block_dropped)
         self.parameters.parameter_changed.connect(self._on_parameter_changed)
         self.palette_widget.block_activated.connect(self._on_palette_activated)
 
@@ -81,7 +91,7 @@ class EditorWindow(QMainWindow):
         if path is not None:
             self.open_path(path)
         else:
-            self._apply_graph(self._graph)
+            self._apply_graph(self.session.graph)
 
     def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         """Fit the diagram the first time the window is actually on screen.
@@ -143,6 +153,7 @@ class EditorWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         file_menu = self.menuBar().addMenu("&File")
+        edit_menu = self.menuBar().addMenu("&Edit")
         run_menu = self.menuBar().addMenu("&Run")
         view_menu = self.menuBar().addMenu("&View")
 
@@ -168,6 +179,15 @@ class EditorWindow(QMainWindow):
         add(file_menu, "Save &As…", self.save_as, "Ctrl+Shift+S")
         file_menu.addSeparator()
         add(file_menu, "&Quit", self.close, "Ctrl+Q")
+
+        toolbar.addSeparator()
+        self.action_undo = add(edit_menu, "&Undo", self.undo, "Ctrl+Z", True)
+        self.action_redo = add(edit_menu, "&Redo", self.redo, "Ctrl+Shift+Z", True)
+        edit_menu.addSeparator()
+        add(edit_menu, "&Delete", self.delete_selection, "Del")
+        add(edit_menu, "Re&name…", self.rename_selection, "F2")
+        self.action_undo.setEnabled(False)
+        self.action_redo.setEnabled(False)
 
         toolbar.addSeparator()
         self.action_run = add(run_menu, "&Run", self.run_continuous, "F5", True)
@@ -203,21 +223,25 @@ class EditorWindow(QMainWindow):
         return specs, problems
 
     def _apply_graph(self, graph: Graph) -> None:
-        self._graph = graph
+        """Load a new document: rebuild the scene and drop the undo history."""
+        self.session.reset(graph)
+        self._refresh_scene()
+        self.previews.clear()
+        self._update_title()
+        self._update_status()
+
+    def _refresh_scene(self) -> None:
+        graph = self.session.graph
         specs, problems = self._specs_for(graph)
         self.scene.set_graph(graph, specs)
         self.parameters.set_graph(graph)
-        self.previews.clear()
         for problem in problems:
             self._log(f"warning: {problem}")
-        self._update_title()
-        self._update_status()
 
     def new_diagram(self) -> None:
         if not self._confirm_discard():
             return
         self._path = None
-        self._dirty = False
         self._apply_graph(Graph(name="untitled"))
         self._log("new diagram")
 
@@ -236,7 +260,6 @@ class EditorWindow(QMainWindow):
             self._log(f"error: {exc}")
             return
         self._path = path
-        self._dirty = False
         self._apply_graph(graph)
         self._log(f"opened {path}")
         self.view.enable_auto_fit()
@@ -245,11 +268,11 @@ class EditorWindow(QMainWindow):
         if self._path is None:
             return self.save_as()
         try:
-            io.dump(self._graph, self._path)
+            io.dump(self.session.graph, self._path)
         except OSError as exc:
             QMessageBox.critical(self, "Cannot save", str(exc))
             return False
-        self._dirty = False
+        self.session.mark_saved()
         self._update_title()
         self._log(f"saved {self._path}")
         return True
@@ -265,11 +288,11 @@ class EditorWindow(QMainWindow):
             path = path.with_suffix(".yaml")
         self._path = path
         # base_dir decides how relative paths resolve, so it must follow the file.
-        self._graph.base_dir = path.parent.resolve()
+        self.session.graph.base_dir = path.parent.resolve()
         return self.save()
 
     def _confirm_discard(self) -> bool:
-        if not self._dirty:
+        if not self.session.modified:
             return True
         answer = QMessageBox.question(
             self,
@@ -282,56 +305,186 @@ class EditorWindow(QMainWindow):
         return answer == QMessageBox.Discard
 
     def _mark_dirty(self) -> None:
-        if not self._dirty:
-            self._dirty = True
-            self._update_title()
+        self._update_title()
 
     def _update_title(self) -> None:
         name = str(self._path) if self._path else "untitled"
-        self.setWindowTitle(f"{'*' if self._dirty else ''}{name} — pydiedi")
+        marker = "*" if self.session.modified else ""
+        self.setWindowTitle(f"{marker}{name} — pydiedi")
+        self._update_edit_actions()
 
     def _update_status(self) -> None:
-        nodes, edges = len(self._graph.nodes), len(self._graph.edges)
+        nodes, edges = len(self.session.graph.nodes), len(self.session.graph.edges)
         try:
-            topological_order(self._graph)
+            topological_order(self.session.graph)
             order = "acyclic"
         except CycleError:
             order = "cyclic!"
         self._status.setText(f"{nodes} nodes, {edges} edges, {order}")
 
+    # -- editing ----------------------------------------------------------
+    #
+    # Nothing here touches the graph directly. Each handler turns a gesture
+    # into a command on the session, which is what makes undo a property of
+    # the design rather than a feature bolted on.
+
     def _on_parameter_changed(self, node_id: str, name: str, value: object) -> None:
-        node = self._graph.nodes.get(node_id)
-        if node is None:
+        try:
+            self.session.set_param(node_id, name, value)
+        except EditError as exc:
+            self._log(f"refused: {exc}")
             return
-        node.params[name] = value
+        self._mark_dirty()
+
+    def _on_node_moved(self, node_id: str, x: float, y: float) -> None:
+        self.session.move_node(node_id, (x, y))
         self._mark_dirty()
 
     def _on_palette_activated(self, block_name: str) -> None:
-        QMessageBox.information(
-            self,
-            "Not yet",
-            f"Adding blocks from the palette is the next step.\n\n"
-            f"{registry.get(block_name).signature()}",
+        """Double-clicking the palette drops a block in the middle of the view."""
+        centre = self.view.mapToScene(self.view.viewport().rect().center())
+        self._add_block(block_name, centre.x() - 75.0, centre.y() - 30.0)
+
+    def _on_block_dropped(self, block_name: str, x: float, y: float) -> None:
+        self._add_block(block_name, x - 75.0, y - 20.0)
+
+    def _add_block(self, block_name: str, x: float, y: float) -> None:
+        try:
+            node_id = self.session.add_node(block_name, position=(x, y))
+        except (EditError, registry.UnknownBlockError) as exc:
+            self._log(f"refused: {exc}")
+            return
+        self.scene.add_node_item(node_id)
+        self.scene.select_node(node_id)
+        self._after_edit(f"added {node_id}")
+
+    def _on_connect_requested(
+        self, src: str, src_port: str, dst: str, dst_port: str
+    ) -> None:
+        try:
+            self.session.connect(src, src_port, dst, dst_port)
+        except EditError as exc:
+            self._on_connection_refused(str(exc))
+            return
+        self.scene.add_edge_item(self.session.graph.edges[-1])
+        self._after_edit(f"connected {src}.{src_port} to {dst}.{dst_port}")
+
+    def _on_connection_refused(self, reason: str) -> None:
+        self._log(f"refused: {reason}")
+        self.statusBar().showMessage(reason, 4000)
+
+    def _on_delete_requested(self, node_ids: list[str], edges: list[Edge]) -> None:
+        if not node_ids and not edges:
+            return
+        removed: list[str] = []
+        # Edges first: deleting a node takes its edges with it, and doing it
+        # the other way round would try to remove them twice.
+        for edge in edges:
+            if edge.src in node_ids or edge.dst in node_ids:
+                continue
+            try:
+                self.session.disconnect(edge.src, edge.src_port, edge.dst, edge.dst_port)
+            except EditError as exc:
+                self._log(f"refused: {exc}")
+                continue
+            self.scene.remove_edge_item(edge)
+            removed.append(str(edge))
+        for node_id in node_ids:
+            try:
+                self.session.remove_node(node_id)
+            except EditError as exc:
+                self._log(f"refused: {exc}")
+                continue
+            self.scene.remove_node_item(node_id)
+            removed.append(node_id)
+        if removed:
+            self.parameters.show_node(None)
+            self._after_edit(f"removed {', '.join(removed)}")
+
+    def _on_rename_requested(self, node_id: str) -> None:
+        new_id, accepted = QInputDialog.getText(
+            self, "Rename node", "New name:", text=node_id
+        )
+        if not accepted or new_id == node_id:
+            return
+        try:
+            self.session.rename_node(node_id, new_id)
+        except EditError as exc:
+            QMessageBox.warning(self, "Cannot rename", str(exc))
+            return
+        self._refresh_scene()
+        self.scene.select_node(new_id)
+        self._after_edit(f"renamed {node_id} to {new_id}")
+
+    def _after_edit(self, message: str) -> None:
+        self._log(message)
+        self._mark_dirty()
+        self._update_status()
+
+    def undo(self) -> None:
+        description = self.session.undo()
+        if description is None:
+            return
+        self._refresh_scene()
+        self._after_edit(f"undo: {description}")
+
+    def redo(self) -> None:
+        description = self.session.redo()
+        if description is None:
+            return
+        self._refresh_scene()
+        self._after_edit(f"redo: {description}")
+
+    def _update_edit_actions(self) -> None:
+        undo, redo = getattr(self, "action_undo", None), getattr(self, "action_redo", None)
+        if undo is None or redo is None:
+            return
+        undo.setEnabled(self.session.can_undo)
+        redo.setEnabled(self.session.can_redo)
+        undo.setText(
+            f"&Undo {self.session.undo_description}".rstrip()
+            if self.session.can_undo
+            else "&Undo"
+        )
+        redo.setText(
+            f"&Redo {self.session.redo_description}".rstrip()
+            if self.session.can_redo
+            else "&Redo"
         )
 
+    def delete_selection(self) -> None:
+        self.scene._request_delete()
+
+    def rename_selection(self) -> None:
+        selected = self.scene.selected_node_ids()
+        if len(selected) == 1:
+            self._on_rename_requested(selected[0])
+
     def auto_layout(self) -> None:
-        self.scene.auto_layout()
-        self.scene.tighten_scene_rect()
+        computed = self.scene.auto_layout()
+        if computed:
+            self.session.set_layout(computed)
+            self._after_edit("auto layout")
         self.view.enable_auto_fit()
+
+    def _on_layout_computed(self, layout: dict) -> None:
+        """The scene placed nodes that arrived without positions."""
+        self.session.set_layout({**self.session.graph.layout, **layout})
+        self._mark_dirty()
 
     # -- running ----------------------------------------------------------
 
     def check(self) -> None:
         self.scene.clear_errors()
         try:
-            self._graph.validate()
+            self.session.graph.validate()
         except ValidationError as exc:
             for problem in exc.problems:
                 self._log(f"invalid: {problem}")
             QMessageBox.warning(self, "Diagram is not runnable", str(exc))
             return
         try:
-            order = topological_order(self._graph)
+            order = topological_order(self.session.graph)
         except CycleError as exc:
             self._log(f"invalid: {exc}")
             QMessageBox.warning(self, "Diagram is not runnable", str(exc))
@@ -350,7 +503,7 @@ class EditorWindow(QMainWindow):
             return
         self.scene.clear_errors()
         try:
-            self._graph.validate()
+            self.session.graph.validate()
         except ValidationError as exc:
             for problem in exc.problems:
                 self._log(f"invalid: {problem}")
@@ -358,7 +511,7 @@ class EditorWindow(QMainWindow):
             return
 
         worker = ExecutionWorker(
-            self._graph,
+            self.session.graph,
             iterations=iterations,
             interval=interval,
             on_error=OnError.skip,
