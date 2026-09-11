@@ -86,6 +86,13 @@ class ExecutionWorker(QThread):
     """The run ended by itself, e.g. a video reached its last frame."""
     failed = Signal(str)
     """The run could not start or aborted. Carries a message for the user."""
+    rejected = Signal(str)
+    """A live edit did not take, but the run continues.
+
+    Distinct from :attr:`failed` on purpose. A half-built diagram is the normal
+    state while editing -- a block dropped but not yet wired has an unsatisfied
+    input -- and that must not stop what is already running.
+    """
     started_running = Signal()
     """The executor is built and the first sweep is about to happen."""
 
@@ -108,6 +115,7 @@ class ExecutionWorker(QThread):
         self._mutex = QMutex()
         self._in_flight = 0
         self._pending_params: dict[tuple[str, str], Any] = {}
+        self._pending_graph: Graph | None = None
         self._watched: set[tuple[str, str]] = set()
 
     # -- called from the GUI thread ---------------------------------------
@@ -137,6 +145,27 @@ class ExecutionWorker(QThread):
             for node_id, node in graph.nodes.items():
                 for name, value in node.params.items():
                     self._pending_params[(node_id, name)] = value
+
+    def set_graph(self, graph: Graph) -> None:
+        """Hand the running diagram a new structure.
+
+        Adding a block, dragging a wire or deleting an arrow takes effect on the
+        next sweep, which is how flodiedi behaved and the reason it was pleasant
+        to work in: you never stopped the diagram to change it.
+
+        A snapshot is taken here, on the GUI thread, so the worker never reads a
+        graph the user is still editing. Only the newest snapshot matters -- a
+        burst of edits collapses into one re-sync.
+        """
+        snapshot = copy.deepcopy(graph)
+        snapshot.base_dir = graph.base_dir
+        with QMutexLocker(self._mutex):
+            self._pending_graph = snapshot
+
+    def _take_pending_graph(self) -> Graph | None:
+        with QMutexLocker(self._mutex):
+            pending, self._pending_graph = self._pending_graph, None
+            return pending
 
     def _take_pending_params(self) -> dict[tuple[str, str], Any]:
         with QMutexLocker(self._mutex):
@@ -246,6 +275,22 @@ class ExecutionWorker(QThread):
                     if self.isInterruptionRequested():
                         break
 
+                # Structure first, so a parameter typed into a block added in
+                # the same breath lands on a node the executor knows about.
+                pending_graph = self._take_pending_graph()
+                if pending_graph is not None:
+                    try:
+                        pending_graph.validate()
+                        executor.sync(pending_graph)
+                        # Also the worker's own copy, which _resolve() consults
+                        # to map a watched input back to the output feeding it.
+                        self._graph = pending_graph
+                    except Exception as exc:  # noqa: BLE001
+                        # A half-built diagram is normal while editing: a block
+                        # dropped but not yet wired has an unsatisfied input.
+                        # Keep running the structure that does work.
+                        self.rejected.emit(str(exc))
+
                 for (node_id, name), value in self._take_pending_params().items():
                     try:
                         executor.set_param(node_id, name, value)
@@ -253,7 +298,7 @@ class ExecutionWorker(QThread):
                         # A half-typed value in a text field is normal while
                         # editing; report it and keep the previous one rather
                         # than stopping the run.
-                        self.failed.emit(f"{node_id}.{name}: {exc}")
+                        self.rejected.emit(f"{node_id}.{name}: {exc}")
 
                 started = time.perf_counter()
                 try:

@@ -233,22 +233,61 @@ class Executor:
         if validate:
             graph.validate()
         self.on_error = OnError(on_error)
-        self.order = topological_order(graph)
-        self._specs = {
-            node.id: registry.get(node.block) for node in graph.nodes.values()
-        }
-        # Literals from the file are coerced once, not on every sweep: a
-        # diagram running at 30 fps should not re-parse its enums 30 times a
-        # second.
-        self._params = {
-            node.id: coerce_params(node, self._specs[node.id], graph.base_dir)
-            for node in graph.nodes.values()
-        }
+        self._specs: dict[str, BlockSpec] = {}
+        self._params: dict[str, dict[str, Any]] = {}
         # One instance per node, so two 'camera' nodes are two devices rather
         # than one shared and mutually corrupting object.
-        self._instances: dict[str, Any] = {
-            node_id: spec.instantiate() for node_id, spec in self._specs.items()
+        self._instances: dict[str, Any] = {}
+        # What each input last received. An input that loses its edge keeps the
+        # value it last saw; see step().
+        self._held: dict[str, dict[str, Any]] = {}
+        self.order: list[str] = []
+        self._dependents: dict[str, set[str]] = {}
+        self.sync(graph)
+
+    def sync(self, graph: Graph) -> None:
+        """Adopt a changed graph without restarting anything that still exists.
+
+        This is what made flodiedi hot-editable, and it is the single mechanism
+        the whole design turned on: its ``execute()`` re-ran
+        ``findExecutionOrder()`` at the head of any sweep where ``dirty`` was
+        set (``flowdiagram.cpp:183``), so adding a block, dragging a wire or
+        deleting an arrow took effect within one ``SleepTime``.
+
+        The part that needs care here and did not exist there: stateful blocks.
+        A node that survives the edit keeps its instance, so adding a filter
+        downstream of a camera does not reopen the camera. Only nodes that are
+        gone are closed, and only new ones are constructed.
+        """
+        self.graph = graph
+        specs = {node.id: registry.get(node.block) for node in graph.nodes.values()}
+
+        for node_id in list(self._instances):
+            gone = node_id not in specs
+            replaced = (
+                not gone and specs[node_id].name != self._specs[node_id].name
+            )
+            if gone or replaced:
+                try:
+                    self._specs[node_id].close(self._instances[node_id])
+                except Exception:  # noqa: BLE001 - a bad close must not stop the edit
+                    pass
+                del self._instances[node_id]
+                self._held.pop(node_id, None)
+
+        for node_id, spec in specs.items():
+            if node_id not in self._instances:
+                self._instances[node_id] = spec.instantiate()
+                self._held.setdefault(node_id, {})
+
+        self._specs = specs
+        # Literals are coerced once per edit, not per sweep: a diagram running
+        # at 30 fps should not re-parse its enums thirty times a second.
+        self._params = {
+            node.id: coerce_params(node, specs[node.id], graph.base_dir)
+            for node in graph.nodes.values()
         }
+        self.order = topological_order(graph)
         self._dependents = self._build_dependents()
 
     def _build_dependents(self) -> dict[str, set[str]]:
@@ -289,6 +328,11 @@ class Executor:
         if port is None:
             raise KeyError(f"block {spec.name!r} has no input {name!r}")
         self._params[node_id][name] = coerce_param(value, port, self.graph.base_dir)
+        # Typing a value takes the port back from whatever was last transmitted
+        # into it, so an input can be unplugged and then hand-driven -- which is
+        # exactly what flodiedi allowed, because there ports and parameters were
+        # the same Q_PROPERTY.
+        self._held.get(node_id, {}).pop(name, None)
 
     def step(self, iteration: int = 0) -> RunResult:
         """Execute every node once, in order."""
@@ -303,9 +347,23 @@ class Executor:
 
             node = self.graph.nodes[node_id]
             spec = self._specs[node_id]
+
+            # Precedence: a live connection beats a value held from a previous
+            # sweep, which beats a literal parameter.
+            #
+            # Holding matters. In flodiedi, removing a connection touched only
+            # the edge list -- the receiving block kept whatever was last
+            # written into its property (flowdiagram.cpp:112-126), so unplugging
+            # a wire froze the downstream image instead of blanking it. That was
+            # a genuinely useful debugging move, and the reason inputs are not
+            # reset here.
             values = dict(self._params[node_id])
+            values.update(self._held.get(node_id, {}))
+            held = self._held.setdefault(node_id, {})
             for edge in self.graph.incoming(node_id):
-                values[edge.dst_port] = wire[(edge.dst, edge.dst_port)]
+                value = wire[(edge.dst, edge.dst_port)]
+                values[edge.dst_port] = value
+                held[edge.dst_port] = value
 
             try:
                 produced = spec.call(values, self._instances[node_id])

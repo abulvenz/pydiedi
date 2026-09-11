@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 from ..core import registry
 from ..core.block import BlockSpec, Port, PortKind
 from ..core.edit import can_connect
+from ..core.layout import NodeBox, layered_layout
 from ..core.graph import Edge, Graph
 
 __all__ = ["DiagramScene", "DiagramView", "NodeItem", "PortItem", "EdgeItem"]
@@ -387,6 +388,7 @@ class EdgeItem(QGraphicsPathItem):
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
         self._hovered = False
+        self._route: list[QPointF] = []
         self.refresh()
 
     def shape(self) -> QPainterPath:
@@ -403,9 +405,26 @@ class EdgeItem(QGraphicsPathItem):
         self._hovered = False
         self.refresh()
 
+    def set_route(self, waypoints: list[tuple[float, float]]) -> None:
+        """Points the edge should pass through, from the layout.
+
+        An edge spanning several layers gets a lane of its own there, which is
+        the difference between a cable that goes round the intervening blocks
+        and one that cuts across them.
+        """
+        self._route = [QPointF(x, y) for x, y in waypoints]
+        self.refresh()
+
     def refresh(self) -> None:
         start = self.source.scenePos()
         end = self.target.scenePos()
+        route = getattr(self, "_route", [])
+
+        if route:
+            self.setPath(_smooth_path([start, *route, end]))
+            self._apply_pen()
+            return
+
         # A horizontal tangent proportional to the gap reads as a cable and
         # keeps edges distinguishable when nodes overlap vertically.
         stretch = max(40.0, abs(end.x() - start.x()) * 0.5)
@@ -416,6 +435,9 @@ class EdgeItem(QGraphicsPathItem):
             end,
         )
         self.setPath(path)
+        self._apply_pen()
+
+    def _apply_pen(self) -> None:
         colour = port_colour(self.source.port.type_name)
         if self.isSelected():
             self.setPen(QPen(COLOUR_BORDER_SELECTED, 2.8, Qt.SolidLine, Qt.RoundCap))
@@ -453,6 +475,155 @@ class PendingConnection(QGraphicsPathItem):
         self.setPath(path)
         colour = port_colour(self.origin.port.type_name) if valid else COLOUR_INVALID
         self.setPen(QPen(colour, 2.0, Qt.SolidLine if valid else Qt.DashLine, Qt.RoundCap))
+
+
+class PortProbeItem(QGraphicsItem):
+    """A floating readout of one watched port: the image on it, or its value.
+
+    flodiedi's equivalent was ``ImageToolTip`` -- a ``QGraphicsPixmapItem``
+    parked in the scene at the point you clicked, refreshed on a 30 ms timer
+    that read the live property under ``prLock.tryLock(1)``
+    (``flowportitem.h:77-93``). That was the best-engineered piece of live
+    introspection in the project, and its one flaw was that the item sat at a
+    fixed scene position and did not follow the node when it was dragged.
+
+    Here the probe is a child of the node, so it follows; and the value arrives
+    as an already-summarised :class:`~pydiedi.core.inspect.PortValue` rather
+    than being polled, so nothing reads across a thread boundary.
+    """
+
+    PADDING = 6.0
+    TITLE_HEIGHT = 14.0
+    MIN_WIDTH = 110.0
+
+    def __init__(self, node: NodeItem, port: PortItem) -> None:
+        # Top-level, not a child of the node: a child inherits its parent's
+        # place in the stacking order, so a probe would be drawn underneath
+        # the next node along. follow() keeps it attached instead.
+        super().__init__()
+        self.node_id = node.node_id
+        self.port_name = port.port.name
+        self._side = 1 if port.port.kind is PortKind.OUT else -1
+        self._offset = QPointF(0.0, port.pos().y() - 10.0)
+        self._pixmap: QPixmap | None = None
+        self._text = "not run yet"
+        self._title = f"{node.node_id}.{port.port.name}"
+        self.setZValue(50.0)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setToolTip("drag to move, click the port again to hide")
+        self.follow(node)
+
+    def follow(self, node: NodeItem) -> None:
+        """Sit beside the port, on the side it faces, so as not to cover the node."""
+        if self._side > 0:
+            x = node.pos().x() + NODE_WIDTH + 24.0
+        else:
+            x = node.pos().x() - (self.boundingRect().width() + 24.0)
+        self.setPos(QPointF(x, node.pos().y() + self._offset.y()))
+
+    def set_value(self, pixmap: QPixmap | None, text: str) -> None:
+        self.prepareGeometryChange()
+        self._pixmap = pixmap
+        self._text = text
+        self.update()
+
+    def extent(self) -> QRectF:
+        """Where the probe sits relative to its node, for the layout."""
+        rect = self.boundingRect()
+        if self._side > 0:
+            return QRectF(NODE_WIDTH + 24.0, self._offset.y(), rect.width(), rect.height())
+        return QRectF(
+            -(rect.width() + 24.0), self._offset.y(), rect.width(), rect.height()
+        )
+
+    def _body_size(self) -> tuple[float, float]:
+        if self._pixmap is not None and not self._pixmap.isNull():
+            return float(self._pixmap.width()), float(self._pixmap.height())
+        metrics = QFontMetrics(_probe_font())
+        return (
+            max(self.MIN_WIDTH, metrics.horizontalAdvance(self._text) + 4),
+            float(metrics.height()),
+        )
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        width, height = self._body_size()
+        return QRectF(
+            0,
+            0,
+            max(width, self.MIN_WIDTH) + 2 * self.PADDING,
+            height + self.TITLE_HEIGHT + 2 * self.PADDING,
+        )
+
+    def paint(self, painter: QPainter, option: object, widget: object = None) -> None:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.boundingRect()
+        path = QPainterPath()
+        path.addRoundedRect(rect, 4, 4)
+        painter.setBrush(QBrush(QColor("#1b1d22")))
+        painter.setPen(QPen(COLOUR_VALUE, 1.2))
+        painter.drawPath(path)
+
+        font = _probe_font()
+        painter.setFont(font)
+        painter.setPen(QPen(COLOUR_VALUE))
+        painter.drawText(
+            QRectF(self.PADDING, 2, rect.width() - 2 * self.PADDING, self.TITLE_HEIGHT),
+            Qt.AlignVCenter | Qt.AlignLeft,
+            _elide(self._title, font, rect.width() - 2 * self.PADDING),
+        )
+
+        width, height = self._body_size()
+        body = QRectF(
+            (rect.width() - width) / 2.0,
+            self.TITLE_HEIGHT + self.PADDING,
+            width,
+            height,
+        )
+        if self._pixmap is not None and not self._pixmap.isNull():
+            painter.drawPixmap(body.topLeft(), self._pixmap)
+            # NoBrush, or drawRect fills the frame with the panel background
+            # still set on the painter -- painting over the image just drawn.
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(COLOUR_BORDER, 1.0))
+            painter.drawRect(body)
+        else:
+            painter.setPen(QPen(COLOUR_TEXT))
+            painter.drawText(
+                body, Qt.AlignVCenter | Qt.AlignLeft, _elide(self._text, font, width)
+            )
+
+
+def _smooth_path(points: list[QPointF]) -> QPainterPath:
+    """A rounded path through every point, with horizontal ends.
+
+    Catmull-Rom tangents converted to cubic control points: the curve goes
+    through each waypoint rather than near it, which matters because the
+    waypoints are the gaps the layout reserved between nodes.
+    """
+    path = QPainterPath(points[0])
+    if len(points) == 2:
+        stretch = max(40.0, abs(points[1].x() - points[0].x()) * 0.5)
+        path.cubicTo(
+            QPointF(points[0].x() + stretch, points[0].y()),
+            QPointF(points[1].x() - stretch, points[1].y()),
+            points[1],
+        )
+        return path
+    for i in range(len(points) - 1):
+        p0 = points[i - 1] if i > 0 else points[i]
+        p1, p2 = points[i], points[i + 1]
+        p3 = points[i + 2] if i + 2 < len(points) else points[i + 1]
+        c1 = QPointF(p1.x() + (p2.x() - p0.x()) / 6.0, p1.y() + (p2.y() - p0.y()) / 6.0)
+        c2 = QPointF(p2.x() - (p3.x() - p1.x()) / 6.0, p2.y() - (p3.y() - p1.y()) / 6.0)
+        path.cubicTo(c1, c2, p2)
+    return path
+
+
+def _probe_font() -> QFont:
+    font = QFont()
+    font.setPointSizeF(7.5)
+    return font
 
 
 class DiagramScene(QGraphicsScene):
@@ -502,6 +673,7 @@ class DiagramScene(QGraphicsScene):
         self._pending: PendingConnection | None = None
         self._candidates: list[PortItem] = []
         self._watched: set[tuple[str, str]] = set()
+        self._probes: dict[tuple[str, str], PortProbeItem] = {}
         self._press_point: QPointF | None = None
         self.selectionChanged.connect(self._on_selection_changed)
 
@@ -538,6 +710,10 @@ class DiagramScene(QGraphicsScene):
 
             for edge in graph.edges:
                 self._add_edge_item(edge)
+            # clear() destroyed the probe items along with everything else.
+            self._probes.clear()
+            for node_id, port_name in sorted(self._watched):
+                self._add_probe(node_id, port_name)
         finally:
             self._building = False
 
@@ -574,49 +750,69 @@ class DiagramScene(QGraphicsScene):
         self._edges.append(item)
 
     def auto_layout(self) -> dict[str, tuple[float, float]]:
-        """Place nodes in dependency columns, returning the new positions.
+        """Place nodes in dependency order, returning the new positions.
 
         The scene applies them to its items but never writes them into the
         graph: the caller turns the result into a command, so auto-layout is
         one undo step like any other edit.
-
-        flodiedi shelled out to Graphviz for this, through a wrapper around
-        ``libgraph`` -- a library Graphviz removed in 2012, which is one of the
-        reasons the C++ build no longer links. A depth-based column layout
-        needs no dependency and is adequate for a dataflow graph.
         """
         if self.graph is None:
             return {}
-        depth: dict[str, int] = {}
-        for node_id in self._topological_ids():
-            incoming = self.graph.incoming(node_id)
-            depth[node_id] = (
-                0
-                if not incoming
-                else 1 + max(depth.get(e.src, 0) for e in incoming)
-            )
+        # Real node sizes, so a node carrying a preview gets the room it needs
+        # instead of being overlapped by its neighbour. flodiedi passed sizes to
+        # Graphviz but used boundingRect(), which excludes child items -- so its
+        # labels, embedded widgets and live previews all overlapped after an
+        # auto-layout (gvgraph.cpp:102-114).
+        boxes: dict[str, NodeBox] = {}
+        offsets: dict[str, QPointF] = {}
+        for node_id, item in self._nodes.items():
+            # The union with childrenBoundingRect() is the point: ports, the
+            # inline preview and any open probe are children, and
+            # boundingRect() excludes them. flodiedi passed the bare
+            # boundingRect() to Graphviz (gvgraph.cpp:102-114), which is why
+            # its labels and live previews overlapped after an auto-layout.
+            extent = item.boundingRect() | item.childrenBoundingRect()
+            for (probe_node, _), probe in self._probes.items():
+                if probe_node == node_id:
+                    extent = extent | probe.extent()
+            boxes[node_id] = NodeBox(extent.width(), extent.height())
+            # The layout places the box; the item's own origin sits inside it,
+            # because children may extend to the left of it.
+            offsets[node_id] = extent.topLeft()
+        result = layered_layout(self.graph, boxes)
 
-        columns: dict[int, list[str]] = {}
-        for node_id, column in sorted(depth.items(), key=lambda kv: (kv[1], kv[0])):
-            columns.setdefault(column, []).append(node_id)
-
-        computed: dict[str, tuple[float, float]] = {}
         was_building, self._building = self._building, True
         try:
-            for column, ids in columns.items():
-                for row, node_id in enumerate(ids):
-                    item = self._nodes.get(node_id)
-                    if item is None:
-                        continue
-                    x = column * (NODE_WIDTH + 90.0)
-                    y = row * 140.0 - (len(ids) - 1) * 70.0
-                    item.setPos(QPointF(x, y))
-                    computed[node_id] = (x, y)
+            for node_id, (x, y) in result.positions.items():
+                item = self._nodes.get(node_id)
+                if item is not None:
+                    offset = offsets.get(node_id, QPointF(0, 0))
+                    item.setPos(QPointF(x - offset.x(), y - offset.y()))
         finally:
             self._building = was_building
+
+        for (node_id, _), probe in self._probes.items():
+            node_item = self._nodes.get(node_id)
+            if node_item is not None:
+                probe.follow(node_item)
+        for item in self._edges:
+            item.set_route(result.route_for(item.edge))
         self.refresh_edges()
         self.tighten_scene_rect()
-        return computed
+        return {
+            node_id: (item.pos().x(), item.pos().y())
+            for node_id, item in self._nodes.items()
+        }
+
+    def clear_edge_routes(self) -> None:
+        """Drop routed lanes and go back to direct curves.
+
+        A route is only valid for the arrangement it was computed for, so
+        moving a node by hand invalidates it -- keeping a stale lane would draw
+        an edge looping through where a node used to be.
+        """
+        for item in self._edges:
+            item.set_route([])
 
     def _topological_ids(self) -> list[str]:
         from ..core.executor import CycleError, topological_order
@@ -650,6 +846,16 @@ class DiagramScene(QGraphicsScene):
             edge.refresh()
 
     def node_moved(self, node_id: str, position: QPointF) -> None:
+        node_item = self._nodes.get(node_id)
+        if node_item is not None:
+            for (probe_node, _), probe in self._probes.items():
+                if probe_node == node_id:
+                    probe.follow(node_item)
+        if not self._building:
+            # A hand-moved node invalidates the lanes auto-layout reserved.
+            for item in self._edges:
+                if item.edge.src == node_id or item.edge.dst == node_id:
+                    item.set_route([])
         self.refresh_edges()
         if not self._building:
             self.node_moved_to.emit(node_id, position.x(), position.y())
@@ -688,9 +894,11 @@ class DiagramScene(QGraphicsScene):
         key = (node_id, port)
         if key in self._watched:
             self._watched.discard(key)
+            self._remove_probe(key)
             watched_now = False
         else:
             self._watched.add(key)
+            self._add_probe(node_id, port)
             watched_now = True
         self._apply_watch_marks()
         self.watches_changed.emit(set(self._watched))
@@ -702,6 +910,8 @@ class DiagramScene(QGraphicsScene):
     def clear_watches(self) -> None:
         if not self._watched:
             return
+        for key in list(self._probes):
+            self._remove_probe(key)
         self._watched.clear()
         self._apply_watch_marks()
         for item in self._nodes.values():
@@ -715,15 +925,52 @@ class DiagramScene(QGraphicsScene):
                     child.set_watched((node_id, child.port.name) in self._watched)
 
     def show_port_values(self, values: list) -> None:
-        """Display the latest value of every watched port on its node."""
+        """Display the latest value of every watched port.
+
+        Twice over, deliberately: a one-line summary on the node, which stays
+        readable when several ports are watched, and a probe showing the actual
+        image -- because for a vision pipeline the useful answer to "what is on
+        this wire" is a picture, not a shape and a dtype.
+        """
+        from .preview import to_qimage
+
         by_node: dict[str, list[str]] = {}
         for value in values:
             by_node.setdefault(value.node_id, []).append(
                 f"{value.port} = {value.summary}"
             )
+            probe = self._probes.get(value.key)
+            if probe is None:
+                continue
+            pixmap = None
+            if value.thumbnail is not None:
+                try:
+                    pixmap = QPixmap.fromImage(to_qimage(value.thumbnail))
+                except ValueError:
+                    pixmap = None
+            probe.set_value(pixmap, value.summary)
+
         for node_id, item in self._nodes.items():
             item.set_value_text(" | ".join(by_node.get(node_id, ())))
         self.refresh_edges()
+
+    def _add_probe(self, node_id: str, port_name: str) -> None:
+        node_item = self._nodes.get(node_id)
+        if node_item is None:
+            return
+        port_item = node_item.port_item(
+            port_name, PortKind.OUT
+        ) or node_item.port_item(port_name, PortKind.IN)
+        if port_item is None:
+            return
+        probe = PortProbeItem(node_item, port_item)
+        self.addItem(probe)
+        self._probes[(node_id, port_name)] = probe
+
+    def _remove_probe(self, key: tuple[str, str]) -> None:
+        probe = self._probes.pop(key, None)
+        if probe is not None:
+            self.removeItem(probe)
 
     def clear_errors(self) -> None:
         for item in self._nodes.values():

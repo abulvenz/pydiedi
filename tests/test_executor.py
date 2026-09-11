@@ -337,3 +337,186 @@ def test_coercion_error_names_the_node(real_blocks):
     graph.add(Node(id="blur", block="gaussian_blur", params={"kernel_size": "big"}))
     with pytest.raises((ValidationError, CoercionError), match="blur"):
         graph.validate()
+
+
+# -- live structural edits ------------------------------------------------
+#
+# flodiedi's defining quality: you never stopped a diagram to change it. Its
+# execute() re-ran findExecutionOrder() at the head of any sweep that followed
+# an edit (flowdiagram.cpp:183), so adding a block, dragging a wire or deleting
+# an arrow took effect within one SleepTime.
+
+
+def test_sync_picks_up_a_node_added_between_sweeps():
+    graph = build({"a": ("t_const", {"value": 1})}, [])
+    with Executor(graph) as executor:
+        executor.step(0)
+        graph.add(Node(id="b", block="t_inc", params={"input": 5}))
+        executor.sync(graph)
+        result = executor.step(1)
+    assert result.value("b", "output") == 6
+
+
+def test_sync_picks_up_a_new_connection():
+    graph = build(
+        {"a": ("t_const", {"value": 7}), "b": ("t_inc", {"input": 0})}, []
+    )
+    with Executor(graph) as executor:
+        assert executor.step(0).value("b", "output") == 1
+        graph.nodes["b"].params.pop("input")
+        graph.connect("a", "output", "b", "input")
+        executor.sync(graph)
+        assert executor.step(1).value("b", "output") == 8
+
+
+def test_sync_reorders_when_the_graph_changes():
+    graph = build({"a": ("t_const", {}), "b": ("t_inc", {"input": 0})}, [])
+    with Executor(graph) as executor:
+        graph.nodes["b"].params.pop("input")
+        graph.connect("a", "output", "b", "input")
+        executor.sync(graph)
+        assert executor.order.index("a") < executor.order.index("b")
+
+
+def test_sync_drops_a_removed_node():
+    graph = build({"a": ("t_const", {}), "b": ("t_const", {})}, [])
+    with Executor(graph) as executor:
+        del graph.nodes["b"]
+        executor.sync(graph)
+        result = executor.step()
+    assert set(result.outputs) == {"a"}
+
+
+def test_sync_keeps_the_instance_of_a_surviving_stateful_node(
+    isolated_registry, register
+):
+    """Adding a filter downstream of a camera must not reopen the camera."""
+
+    @block(category="t", name="t_counter", register_globally=False)
+    class Counter:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def __call__(self) -> int:
+            self.n += 1
+            return self.n
+
+    register(Counter)
+    graph = build({"c": ("t_counter", {})}, [])
+    with Executor(graph) as executor:
+        executor.step(0)
+        executor.step(1)
+        instance = executor._instances["c"]
+
+        graph.add(Node(id="other", block="t_const"))
+        executor.sync(graph)
+
+        assert executor._instances["c"] is instance, "the instance must survive"
+        assert executor.step(2).value("c", "output") == 3, "state must survive"
+
+
+def test_sync_closes_the_instance_of_a_removed_node(isolated_registry, register):
+    closed: list[str] = []
+
+    @block(category="t", name="t_res", register_globally=False)
+    class Resource:
+        def __call__(self) -> int:
+            return 1
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    register(Resource)
+    graph = build({"r": ("t_res", {})}, [])
+    with Executor(graph) as executor:
+        executor.step()
+        del graph.nodes["r"]
+        executor.sync(graph)
+        assert closed == ["closed"]
+
+
+def test_sync_replaces_the_instance_when_the_block_behind_an_id_changes():
+    graph = build({"a": ("t_const", {})}, [])
+    with Executor(graph) as executor:
+        graph.nodes["a"] = Node(id="a", block="t_inc", params={"input": 1})
+        executor.sync(graph)
+        assert executor.step().value("a", "output") == 2
+
+
+# -- an unplugged input keeps its last value ------------------------------
+#
+# flodiedi's removeConnection touched only the edge list (flowdiagram.cpp:112);
+# the receiving block kept whatever was last written into its property. Pulling
+# a wire froze the downstream image instead of blanking it, which was a useful
+# debugging move.
+
+
+def test_an_input_keeps_its_value_when_its_edge_is_removed():
+    graph = build(
+        {"src": ("t_const", {"value": 5}), "b": ("t_inc", {})},
+        ["src.output -> b.input"],
+    )
+    with Executor(graph) as executor:
+        assert executor.step(0).value("b", "output") == 6
+        graph.edges.clear()
+        executor.sync(graph)
+        # Still 6: the input held the 5 it last received, rather than falling
+        # back to a default or blanking.
+        assert executor.step(1).value("b", "output") == 6
+
+
+def test_the_held_value_stops_updating_once_unplugged(isolated_registry, register):
+    @block(category="t", name="t_ramp", register_globally=False)
+    class Ramp:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def __call__(self) -> int:
+            self.n += 1
+            return self.n
+
+    register(Ramp)
+    graph = build({"src": ("t_ramp", {}), "b": ("t_inc", {})}, ["src.output -> b.input"])
+    with Executor(graph) as executor:
+        executor.step(0)
+        assert executor.step(1).value("b", "output") == 3  # ramp 2 + 1
+
+        graph.edges.clear()
+        executor.sync(graph)
+        frozen = executor.step(2).value("b", "output")
+        assert executor.step(3).value("b", "output") == frozen, "must stay frozen"
+        assert executor.step(4).value("b", "output") == frozen
+
+
+def test_setting_a_parameter_takes_an_unplugged_input_back():
+    """Disconnect, then hand-drive the input -- as flodiedi allowed, because
+    there a port and a parameter were the same property."""
+    graph = build(
+        {"src": ("t_const", {"value": 5}), "b": ("t_inc", {})},
+        ["src.output -> b.input"],
+    )
+    with Executor(graph) as executor:
+        executor.step(0)
+        graph.edges.clear()
+        executor.sync(graph)
+        executor.set_param("b", "input", 100)
+        assert executor.step(1).value("b", "output") == 101
+
+
+def test_a_connected_input_is_not_overridden_by_a_stale_held_value():
+    graph = build(
+        {"src": ("t_const", {"value": 5}), "b": ("t_inc", {})},
+        ["src.output -> b.input"],
+    )
+    with Executor(graph) as executor:
+        executor.step(0)
+        graph.nodes["src"].params["value"] = 50
+        executor.sync(graph)
+        executor.set_param("src", "value", 50)
+        assert executor.step(1).value("b", "output") == 51
+
+
+def test_a_never_connected_input_uses_its_parameter():
+    graph = build({"b": ("t_inc", {"input": 3})}, [])
+    with Executor(graph) as executor:
+        assert executor.step().value("b", "output") == 4

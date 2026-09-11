@@ -1017,13 +1017,17 @@ def test_the_newest_value_wins(qapp, real_blocks):
 
 
 def test_a_bad_live_value_is_reported_and_the_run_continues(qapp, real_blocks):
-    """Half-typed values are normal while editing a text field."""
+    """Half-typed values are normal while editing a text field.
+
+    Reported through `rejected`, not `failed`: the edit did not take, but the
+    diagram is still running.
+    """
     graph = io.load(MOTION)
     graph.nodes["video"].params["loop"] = True
     worker = ExecutionWorker(graph, iterations=0, on_error=OnError.skip)
     failures: list[str] = []
     reports: list[object] = []
-    worker.failed.connect(failures.append)
+    worker.rejected.connect(failures.append)
 
     def on_swept(report):
         reports.append(report)
@@ -1049,7 +1053,7 @@ def test_setting_an_unknown_parameter_is_reported(qapp, real_blocks):
     graph.nodes["video"].params["loop"] = True
     worker = ExecutionWorker(graph, iterations=0, on_error=OnError.skip)
     failures: list[str] = []
-    worker.failed.connect(failures.append)
+    worker.rejected.connect(failures.append)
     worker.swept.connect(lambda _r: worker.preview_consumed())
     worker.start()
     assert spin(qapp, lambda: worker.isRunning(), timeout=10)
@@ -1062,14 +1066,22 @@ def test_setting_an_unknown_parameter_is_reported(qapp, real_blocks):
     worker.wait()
 
 
-def test_a_structural_change_says_it_needs_a_restart(qapp, window):
+def test_a_structural_change_reaches_the_running_diagram(qapp, window):
+    """Everything is live, structure included. flodiedi's defining quality."""
     editor = window(MOTION)
     editor.session.graph.nodes["video"].params["loop"] = True
     editor.run_continuous()
     assert spin(qapp, lambda: editor._worker is not None and editor._worker.isRunning())
 
     editor._on_palette_activated("canny")
-    assert "restart" in editor.statusBar().currentMessage()
+    editor._on_connect_requested("gray", "output", "canny", "input")
+    editor.scene.toggle_watch("canny", "output")
+
+    assert spin(
+        qapp,
+        lambda: editor.scene._nodes["canny"]._value_text != "",
+        timeout=10,
+    ), "a block added and wired mid-run should start producing"
 
     editor.stop()
     assert spin(qapp, lambda: editor._worker is None, timeout=10)
@@ -1372,3 +1384,304 @@ def test_watching_a_skipped_node_reports_nothing(qapp, real_blocks):
     worker.wait()
     assert reports[0].watched == []
     assert "bad" in reports[0].errors
+
+
+# -- live structural editing through the editor ---------------------------
+
+
+def test_deleting_an_edge_mid_run_freezes_the_downstream_value(qapp, window):
+    """Pull the wire and the image stops updating -- it does not blank."""
+    editor = window(MOTION)
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.scene.toggle_watch("motion", "output")
+    editor.run_continuous()
+    assert spin(
+        qapp, lambda: editor.scene._nodes["motion"]._value_text != "", timeout=10
+    )
+
+    edge = next(e for e in editor.session.graph.edges if e.dst == "mask")
+    editor._on_delete_requested([], [edge])
+
+    # Give the worker several sweeps with the wire pulled.
+    seen: list[str] = []
+    assert spin(
+        qapp,
+        lambda: seen.append(editor.scene._nodes["motion"]._value_text) or len(seen) > 25,
+        timeout=10,
+    )
+    frozen = seen[-6:]
+    assert all(v == frozen[0] for v in frozen), f"value should be frozen, saw {frozen}"
+    assert frozen[0] != "", "and it should still be showing the last value"
+
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+
+
+def test_a_node_deleted_mid_run_stops_being_executed(qapp, window):
+    editor = window(MOTION)
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.run_continuous()
+    assert spin(qapp, lambda: editor._worker is not None and editor._worker.isRunning())
+
+    editor._on_delete_requested(["show"], [])
+    assert spin(
+        qapp,
+        lambda: editor.previews._views and not editor.previews._views[0].isVisibleTo(
+            editor.previews
+        ),
+        timeout=10,
+    )
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+
+
+def test_a_half_built_diagram_does_not_stop_the_run(qapp, window):
+    """Dropping a block before wiring it is the normal state while editing."""
+    editor = window(MOTION)
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.scene.toggle_watch("motion", "output")
+    editor.run_continuous()
+    assert spin(
+        qapp, lambda: editor.scene._nodes["motion"]._value_text != "", timeout=10
+    )
+
+    editor._on_palette_activated("canny")  # required input unsatisfied
+    assert spin(qapp, lambda: "not applied" in editor.log.toPlainText(), timeout=10)
+    assert editor._worker is not None and editor._worker.isRunning()
+
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+
+
+def test_undo_of_a_structural_edit_reaches_the_running_diagram(qapp, window):
+    editor = window(MOTION)
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.scene.toggle_watch("motion", "output")
+    editor.run_continuous()
+    assert spin(
+        qapp, lambda: editor.scene._nodes["motion"]._value_text != "", timeout=10
+    )
+
+    edge = next(e for e in editor.session.graph.edges if e.dst == "mask")
+    editor._on_delete_requested([], [edge])
+    editor.undo()
+
+    # The wire is back, so values move again.
+    seen: set[str] = set()
+    assert spin(
+        qapp,
+        lambda: seen.add(editor.scene._nodes["motion"]._value_text) or len(seen) > 2,
+        timeout=10,
+    ), "values should be changing again after undo"
+
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+
+
+def test_a_stateful_source_is_not_restarted_by_an_unrelated_edit(qapp, window):
+    """Adding a block must not reopen the camera."""
+    editor = window(MOTION)
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.run_continuous()
+    assert spin(qapp, lambda: editor._worker is not None and editor._worker.isRunning())
+    assert spin(qapp, lambda: editor._worker._graph is not None)
+
+    editor._on_palette_activated("gaussian_blur")
+    editor._on_connect_requested("gray", "output", "gaussian_blur", "input")
+    editor.scene.toggle_watch("video", "index")
+
+    # The frame index must keep climbing, i.e. the capture was not reopened.
+    indices: list[str] = []
+    assert spin(
+        qapp,
+        lambda: indices.append(editor.scene._nodes["video"]._value_text)
+        or len(indices) > 30,
+        timeout=15,
+    )
+    numbers = [int(t.split("int ")[1]) for t in indices if "int " in t]
+    assert numbers, "the index should be reported"
+    assert max(numbers) > 2, f"frame index should advance, saw {sorted(set(numbers))}"
+
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+
+
+# -- the probe: an image, not a description -------------------------------
+
+
+def _probe(editor, node_id, port):
+    return editor.scene._probes[(node_id, port)]
+
+
+def _nonflat(pixmap) -> bool:
+    """Whether a pixmap has more than one brightness -- i.e. shows something."""
+    image = pixmap.toImage()
+    seen = {
+        image.pixelColor(x, y).lightness()
+        for y in range(0, image.height(), 5)
+        for x in range(0, image.width(), 5)
+    }
+    return len(seen) > 1
+
+
+def test_watching_an_image_port_opens_a_probe(window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "output")
+    assert ("mask", "output") in editor.scene._probes
+
+
+def test_unwatching_closes_the_probe(window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "output")
+    editor.scene.toggle_watch("mask", "output")
+    assert editor.scene._probes == {}
+
+
+def test_the_probe_shows_the_image_itself(qapp, window):
+    """The point of the exercise: for a vision pipeline the answer to 'what is
+    on this wire' is a picture, not a shape and a dtype."""
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "output")
+    # Run properly rather than stepping. On the first sweep frame_buffer has
+    # nothing to delay and hands back the current frame, so the difference is
+    # correctly all zeros; and a burst of sweeps with no repaint in between is
+    # collapsed by the worker's back-pressure to a single report.
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.run_continuous()
+    assert spin(
+        qapp,
+        lambda: _probe(editor, "mask", "output")._pixmap is not None
+        and _nonflat(_probe(editor, "mask", "output")._pixmap),
+        timeout=15,
+    )
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+
+    pixmap = _probe(editor, "mask", "output")._pixmap
+    assert pixmap is not None
+    assert (pixmap.width(), pixmap.height()) == (96, 96)
+
+    assert _nonflat(pixmap), "the probe should show the image, not a flat block"
+
+
+def test_a_scalar_port_shows_its_value_as_text(qapp, window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("motion", "output")
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    probe = _probe(editor, "motion", "output")
+    assert probe._pixmap is None
+    assert probe._text.startswith("int ")
+
+
+def test_the_probe_is_a_top_level_item(window):
+    """A child inherits its parent's place in the stacking order, so a probe
+    parented to its node is drawn underneath the next node along."""
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "output")
+    probe = _probe(editor, "mask", "output")
+    assert probe.parentItem() is None
+    assert probe.scene() is editor.scene
+    assert probe.zValue() > editor.scene._nodes["mask"].zValue()
+
+
+def test_the_probe_follows_its_node(window):
+    """flodiedi's tooltip sat at the point you clicked and stayed there when
+    the node was dragged away."""
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "output")
+    probe = _probe(editor, "mask", "output")
+    before = probe.pos()
+    editor.scene._nodes["mask"].setPos(1000.0, 500.0)
+    assert probe.pos() != before
+    assert probe.pos().x() > 1000.0, "an output probe sits to the right of its node"
+
+
+def test_an_input_probe_sits_on_the_left(window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "input")
+    probe = _probe(editor, "mask", "input")
+    assert probe.pos().x() < editor.scene._nodes["mask"].pos().x()
+
+
+def test_auto_layout_reserves_room_for_open_probes(qapp, window):
+    """Otherwise the probe lands on top of the next node."""
+    editor = window(MOTION)
+    editor.scene.toggle_watch("gray", "output")
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    editor.auto_layout()
+
+    probe = _probe(editor, "gray", "output")
+    probe_rect = probe.sceneBoundingRect()
+    for node_id, item in editor.scene._nodes.items():
+        if node_id == "gray":
+            continue
+        assert not probe_rect.intersects(item.sceneBoundingRect()), (
+            f"the probe overlaps {node_id}"
+        )
+
+
+def test_probes_survive_a_rebuild(window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "output")
+    editor._refresh_scene()
+    assert ("mask", "output") in editor.scene._probes
+    assert _probe(editor, "mask", "output").scene() is editor.scene
+
+
+def test_clearing_watches_removes_the_probes(window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "output")
+    editor.scene.toggle_watch("motion", "output")
+    editor.scene.clear_watches()
+    assert editor.scene._probes == {}
+
+
+# -- routed edges ---------------------------------------------------------
+
+
+def test_a_long_edge_gets_waypoints_after_auto_layout(qapp, window, tmp_path):
+    path = tmp_path / "d.yaml"
+    path.write_text(
+        "version: 1\n"
+        "nodes:\n"
+        "  src:  {block: imread, params: {path: x.png}}\n"
+        "  a:    {block: gaussian_blur}\n"
+        "  b:    {block: gaussian_blur}\n"
+        "  join: {block: abs_diff}\n"
+        "edges:\n"
+        "  - src.output -> a.input\n"
+        "  - a.output   -> b.input\n"
+        "  - b.output   -> join.a\n"
+        "  - src.output -> join.b\n",
+        encoding="utf-8",
+    )
+    editor = window(None)
+    editor.open_path(path)
+    editor.auto_layout()
+
+    long_edge = next(
+        item for item in editor.scene._edges if item.edge.dst_port == "b"
+    )
+    assert long_edge._route, "an edge spanning layers should be routed"
+    short_edge = next(
+        item for item in editor.scene._edges if item.edge.dst_port == "input"
+    )
+    assert not short_edge._route
+
+
+def test_moving_a_node_drops_its_stale_routes(window):
+    """A route is only valid for the arrangement it was computed for."""
+    editor = window(MOTION)
+    editor.auto_layout()
+    for item in editor.scene._edges:
+        item.set_route([(0.0, 0.0)])
+    editor.scene._nodes["gray"].setPos(500.0, 500.0)
+    touched = [
+        item
+        for item in editor.scene._edges
+        if item.edge.src == "gray" or item.edge.dst == "gray"
+    ]
+    assert touched
+    assert all(not item._route for item in touched)

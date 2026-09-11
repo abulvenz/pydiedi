@@ -359,17 +359,16 @@ class EditorWindow(QMainWindow):
         self._mark_dirty()
 
     def _note_structural_change(self) -> None:
-        """Tell the user that this kind of edit needs a restart.
+        """Hand a structural edit to the running diagram.
 
-        Parameters reach a running diagram; structure does not, because adding
-        a node or an edge mid-sweep would change the execution order underneath
-        the loop walking it. Saying so is better than appearing to ignore the
-        edit.
+        Everything is live: adding a block, dragging a wire and deleting an
+        arrow all take effect on the next sweep. That was flodiedi's defining
+        quality -- you never stopped a diagram to change it -- and it came from
+        one mechanism, re-deriving the execution order at the head of any sweep
+        that followed an edit.
         """
         if self._worker is not None:
-            self.statusBar().showMessage(
-                "Structure changed — restart the run for it to take effect", 5000
-            )
+            self._worker.set_graph(self.session.graph)
 
     def _on_node_moved(self, node_id: str, x: float, y: float) -> None:
         self.session.move_node(node_id, (x, y))
@@ -480,6 +479,7 @@ class EditorWindow(QMainWindow):
             return
         self._refresh_scene()
         if self._worker is not None:
+            self._worker.set_graph(self.session.graph)
             self._worker.sync_params(self.session.graph)
         self._after_edit(f"undo: {description}")
 
@@ -489,6 +489,7 @@ class EditorWindow(QMainWindow):
             return
         self._refresh_scene()
         if self._worker is not None:
+            self._worker.set_graph(self.session.graph)
             self._worker.sync_params(self.session.graph)
         self._after_edit(f"redo: {description}")
 
@@ -577,6 +578,7 @@ class EditorWindow(QMainWindow):
         # thread: this is the boundary flodiedi did not have.
         worker.swept.connect(self._on_swept)
         worker.failed.connect(self._on_failed)
+        worker.rejected.connect(self._on_rejected)
         worker.stopped.connect(self._on_stopped)
         worker.finished.connect(self._on_worker_finished)
         self._worker = worker
@@ -613,6 +615,11 @@ class EditorWindow(QMainWindow):
         # freezes after one frame.
         if self._worker is not None:
             self._worker.preview_consumed()
+
+    def _on_rejected(self, message: str) -> None:
+        """A live edit did not take. The run carries on."""
+        self._log(f"not applied: {message}")
+        self.statusBar().showMessage(message.splitlines()[0], 4000)
 
     def _on_failed(self, message: str) -> None:
         self._log(f"failed: {message}")

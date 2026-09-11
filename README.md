@@ -64,10 +64,11 @@ shown disabled.
 
 **Previews appear on the node that produced them**, not only in the side panel,
 which is what makes a running graph readable at a glance. **Clicking a port**
-shows the value currently on it — `Mat 96x96 uint8, 0..218` for an image, with a
-thumbnail, or `int 252` for a number. Clicking an *input* shows what arrives
-there, resolved through the connection, which is the useful thing to see when a
-block misbehaves. `Ctrl+W` clears the readouts.
+opens a probe beside it showing *the image on that wire* — for a vision
+pipeline the answer to "what is on this port" is a picture, not a shape and a
+dtype. Scalars show their value. Clicking an *input* shows what arrives there,
+resolved through the connection, which is the useful thing to see when a block
+misbehaves. `Ctrl+W` clears the probes.
 
 Both were flodiedi features worth keeping. It built them by letting blocks
 create `QWidget`s hosted in `QGraphicsProxyWidget`s, which is exactly how
@@ -75,6 +76,20 @@ painting ended up on the worker thread; here the block returns a `Preview` and
 the renderer draws it. Values are summarised on the worker thread and only the
 summary crosses over, so a 4K frame stays where it was produced — and nothing
 is summarised at all unless a port is being watched.
+
+**Auto-layout** (`Ctrl+L`) is a layered Sugiyama layout: longest-path layering,
+barycentre sweeps to reduce crossings, then coordinates that pull each node
+towards what feeds it. An edge spanning several layers gets a placeholder in
+each layer it passes over, so it is given a lane of its own rather than being
+drawn straight across whatever sits in between.
+
+flodiedi used Graphviz for this, and `GVGraph::edges()` extracted the splines
+Graphviz computed into a complete `QPainterPath` (`gvgraph.cpp:216-265`) — which
+`layout()` then never called, resetting every connection to a straight line
+(`flowdiagramscene.cpp:501-514`). All that routing was computed and thrown away,
+which is why its edges ran through nodes. It also sized nodes with
+`boundingRect()`, which excludes child items, so labels and previews overlapped
+afterwards.
 
 While a connection is being dragged, every port it could legally land on is
 haloed and the line reaches for the nearest one. flodiedi did the same and it
@@ -162,7 +177,7 @@ result is visible in its own repository: `loadPointCloudplugin` shipped with
 ```
 pydiedi/
 ├── core/          no Qt, no cv2 — graph, executor, blocks, edit commands,
-│                  value inspection, file format
+│                  layout, value inspection, file format
 ├── blocks/        the block library; cv2 and numpy, never a GUI toolkit
 │   ├── sources.py     camera, video_file, frame_buffer  (stateful)
 │   ├── imageio.py     imread, imwrite
@@ -215,18 +230,30 @@ positions and a spin box emits a value per keystroke, so `MoveNode` and
 per event. And `modified` is undo-aware: undoing back to the last save clears
 the asterisk instead of leaving the document dirty forever.
 
-### Live parameters
+### Everything is live
 
-Changing a parameter takes effect on a running diagram's next sweep, which is
-the whole reason to have a preview next to the controls. Structure does not:
-adding a node or an edge mid-sweep would change the execution order underneath
-the loop walking it, so the worker keeps a structural snapshot and the status
-bar says a restart is needed.
+You never stop a diagram to change it. Type a parameter, drop a block, drag a
+wire, delete an arrow — all of it takes effect on the next sweep. That was
+flodiedi's defining quality, and it came from one mechanism: re-deriving the
+execution order at the head of any sweep that followed an edit
+(`flowdiagram.cpp:183`).
 
-Values are queued and applied between sweeps on the worker's own thread rather
-than written into the executor from the GUI thread, and the newest value for a
-parameter wins — a dragged slider should not make the worker replay every
-intermediate position.
+Two details that only matter once something stateful is running:
+
+* **A node that survives an edit keeps its instance.** Adding a filter
+  downstream of a camera does not reopen the camera. Only removed nodes are
+  closed, only new ones constructed.
+* **Unplugging a wire freezes the input; it does not blank it.** flodiedi's
+  `removeConnection` touched only the edge list (`flowdiagram.cpp:112`), so the
+  receiving block kept whatever was last written into it. Pulling a cable to
+  freeze a frame is a genuinely useful debugging move, and typing into the
+  parameter afterwards takes the port back.
+
+Edits are queued and applied between sweeps on the worker's own thread rather
+than written into the executor from the GUI thread, and only the newest state
+matters — a dragged slider does not make the worker replay every intermediate
+position. A half-built diagram (a block dropped but not yet wired) is reported
+and ignored rather than stopping what already runs.
 
 ### Threading
 
@@ -308,7 +335,7 @@ red node does not halt the diagram.
 ## Test
 
 ```sh
-uv run pytest            # 348 tests, GUI included (offscreen)
+uv run pytest            # 401 tests, GUI included (offscreen)
 ```
 
 ## Known limitations
