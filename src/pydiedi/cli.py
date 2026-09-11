@@ -118,6 +118,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 3 if result.errors else 0
 
 
+def _cmd_edit(args: argparse.Namespace) -> int:
+    # Imported here, not at module scope: the CLI must keep working with no Qt
+    # installed, which is the point of the optional extra.
+    from .gui import require_qt
+
+    require_qt()
+    from .gui.app import main as gui_main
+
+    registry.discover()
+    if args.file is not None and not args.file.exists():
+        print(f"error: no such file: {args.file}", file=sys.stderr)
+        return 2
+    return gui_main(args.file)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pydiedi",
@@ -163,6 +178,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.set_defaults(func=_cmd_run)
+
+    edit = sub.add_parser("edit", help="open the editor (needs the gui extra)")
+    edit.add_argument("file", type=Path, nargs="?", help="diagram to open")
+    edit.set_defaults(func=_cmd_edit)
 
     return parser
 

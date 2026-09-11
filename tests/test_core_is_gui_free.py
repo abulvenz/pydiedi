@@ -114,3 +114,63 @@ def test_core_does_not_import_cv2() -> None:
                 offenders.append(f"{path.relative_to(SRC)}:{node.lineno}")
 
     assert not offenders, "pydiedi.core imports cv2 at:\n" + "\n".join(offenders)
+
+
+# -- the GUI must stay optional -------------------------------------------
+
+
+def test_importing_pydiedi_gui_does_not_load_qt() -> None:
+    """The package uses a lazy __getattr__ so `import pydiedi.gui` is cheap.
+
+    Without that, anything touching the package -- including a --help -- would
+    require the optional extra.
+    """
+    script = (
+        "import sys, json\n"
+        "import pydiedi.gui\n"
+        f"found = sorted(m for m in sys.modules if m.split('.')[0] in {GUI_MODULES!r})\n"
+        "print(json.dumps(found))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "[]", (
+        f"importing pydiedi.gui eagerly loaded {proc.stdout.strip()}"
+    )
+
+
+def test_the_cli_does_not_import_qt_at_module_scope() -> None:
+    """`pydiedi run` must work in an install without the gui extra."""
+    script = (
+        "import sys, json\n"
+        "from pydiedi import cli\n"
+        "cli.build_parser()\n"
+        f"found = sorted(m for m in sys.modules if m.split('.')[0] in {GUI_MODULES!r})\n"
+        "print(json.dumps(found))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "[]", f"the CLI loaded {proc.stdout.strip()}"
+
+
+def test_gui_package_is_the_only_one_importing_qt() -> None:
+    """A blunt check across the whole source tree."""
+    offenders: list[str] = []
+    for path in sorted((SRC / "pydiedi").rglob("*.py")):
+        relative = path.relative_to(SRC)
+        if relative.parts[1] == "gui":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                names = [node.module]
+            for name in names:
+                if name.split(".")[0] in GUI_MODULES:
+                    offenders.append(f"{relative}:{node.lineno}: {name}")
+    assert not offenders, "Qt imported outside pydiedi.gui:\n" + "\n".join(offenders)

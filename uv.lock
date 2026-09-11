@@ -147,6 +147,7 @@ gui = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pyside6" },
     { name = "pytest" },
 ]
 
@@ -160,7 +161,10 @@ requires-dist = [
 provides-extras = ["gui"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8.0" }]
+dev = [
+    { name = "pyside6", specifier = ">=6.7" },
+    { name = "pytest", specifier = ">=8.0" },
+]
 
 [[package]]
 name = "pygments"

@@ -6,7 +6,8 @@ Visual dataflow for image processing: build a graph of processing blocks, run it
 see what comes out. flodiedi was written 2010–2013 in C++/Qt4; this is the same
 idea in Python, where most of its machinery turns out to be unnecessary.
 
-**Status: phase 1 — the core runs headless, including live camera and video. No GUI yet.**
+**Status: phase 3 — headless runner and a Qt editor that views and runs diagrams.
+Editing the graph itself (adding blocks, drawing connections) is the next step.**
 
 ## Why a rewrite rather than a port
 
@@ -42,8 +43,30 @@ acceptance test.
 ## Install
 
 ```sh
-uv sync
+uv sync                 # core and block library
+uv sync --extra gui     # plus the Qt editor
 ```
+
+## The editor
+
+```sh
+uv run pydiedi edit tests/fixtures/motion.yaml
+```
+
+![the editor running a frame-differencing diagram](doc/editor.png)
+
+It opens a diagram, shows the graph, runs it and displays whatever the
+`preview` blocks produce. Failing nodes turn red and name the problem; a
+required input with no value is drawn as a hollow port, so a diagram that
+cannot run says so before you run it. Parameters on the right are generated
+from the block's type hints — a combo box for an enum, a file chooser for a
+`Path`, and an input fed by a connection is shown disabled.
+
+The view keeps the whole diagram in frame until you zoom or pan. That is not
+cosmetic: a requested window size is only a request, and a tiling window
+manager ignores it outright — the window is mapped and then resized to its
+tile, so a fit computed once at startup is scaled for a viewport that never
+existed.
 
 ## Use
 
@@ -124,7 +147,12 @@ pydiedi/
 │   ├── filtering.py   blur, threshold, canny
 │   ├── colours.py     cvt_color
 │   └── display.py     preview, side_by_side
-├── gui/           phase 3, PySide6
+├── gui/           the only package that imports Qt; optional
+│   ├── worker.py      runs the executor off the GUI thread
+│   ├── canvas.py      QGraphicsScene of nodes, ports, edges
+│   ├── preview.py     Preview -> QImage
+│   ├── palette.py     block list and parameter editor
+│   └── window.py      the editor window
 └── cli.py         headless runner
 ```
 
@@ -141,9 +169,24 @@ plugins used it, which forced a global `usesGui_` flag to special-case headless
 execution and produced `setPixmap()` calls from the worker thread — tolerated by
 Qt4, fatal in Qt5 and Qt6.
 
-`tests/test_core_is_gui_free.py` enforces the rule with two independent checks:
-a subprocess import that inspects `sys.modules`, and an AST scan that also
-catches lazy or unreachable imports.
+`tests/test_core_is_gui_free.py` enforces the rule with independent checks: a
+subprocess import that inspects `sys.modules`, an AST scan that also catches
+lazy or unreachable imports, and a check that `import pydiedi.gui` itself does
+not pull in Qt — so `pydiedi run` keeps working in an install without the extra.
+
+### Threading
+
+The editor runs the executor on a worker thread. Blocks return `Preview`
+values, which cross to the GUI thread as a queued signal; nothing in `core` or
+`blocks` knows the worker exists.
+
+Two hazards a naive version hits as soon as a camera is attached are handled
+explicitly. The worker **drops previews while one is still in flight**, because
+sweeping faster than the GUI can repaint would queue signals until memory ran
+out — for a live view, showing the newest frame and discarding the rest is
+correct. And a `Preview` carries a *reference* to a numpy array rather than a
+copy, which is safe only because blocks treat their inputs as read-only and
+return freshly allocated arrays. That is the contract for a pydiedi block.
 
 ## Blocks
 
@@ -211,12 +254,14 @@ red node does not halt the diagram.
 ## Test
 
 ```sh
-uv run pytest            # 155 tests
+uv run pytest            # 208 tests, GUI included (offscreen)
 ```
 
 ## Known limitations
 
-- **No GUI.** Diagrams are written by hand for now; phase 3 brings PySide6.
+- **The editor views and runs; it does not yet edit the graph.** Moving nodes,
+  auto-layout and parameter editing work and save. Adding a block from the
+  palette and drawing a connection are the next step.
 - **Execution is serial.** One sweep in topological order, as in flodiedi.
   Running independent branches in parallel is feasible — `cv2` releases the
   GIL — but correctness first.

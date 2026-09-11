@@ -7,12 +7,17 @@ each test a clean slate and restores what was there before.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 import pytest
 
-from pydiedi.core import registry
-from pydiedi.core.block import BlockSpec
+# Must happen before anything imports Qt, so the GUI tests never try to reach a
+# display. conftest is imported ahead of the test modules.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from pydiedi.core import registry  # noqa: E402
+from pydiedi.core.block import BlockSpec  # noqa: E402
 
 
 @pytest.fixture
