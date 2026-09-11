@@ -35,13 +35,14 @@ from __future__ import annotations
 import copy
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from PySide6.QtCore import QMutex, QMutexLocker, QThread, Signal
 
 from ..core import registry
 from ..core.executor import Executor, NodeExecutionError, OnError, StopExecution
 from ..core.graph import Graph, ValidationError
-from ..core.types import Preview
+from ..core.types import CoercionError, Preview
 
 __all__ = ["ExecutionWorker", "SweepReport"]
 
@@ -96,12 +97,40 @@ class ExecutionWorker(QThread):
         self._on_error = OnError(on_error)
         self._mutex = QMutex()
         self._in_flight = 0
+        self._pending_params: dict[tuple[str, str], Any] = {}
 
     # -- called from the GUI thread ---------------------------------------
 
     def request_stop(self) -> None:
         """Ask the run to end after the current sweep."""
         self.requestInterruption()
+
+    def set_param(self, node_id: str, name: str, value: Any) -> None:
+        """Change a parameter of the running diagram.
+
+        Queued rather than written straight into the executor, so the value
+        lands between sweeps on the thread that runs them instead of racing a
+        sweep in progress. The newest value for a given parameter wins: a slider
+        dragged across its range should not make the worker replay every
+        intermediate position.
+        """
+        with QMutexLocker(self._mutex):
+            self._pending_params[(node_id, name)] = value
+
+    def sync_params(self, graph: Graph) -> None:
+        """Push every parameter of ``graph`` to the running diagram.
+
+        Used after an undo, where any number of values may have changed at once.
+        """
+        with QMutexLocker(self._mutex):
+            for node_id, node in graph.nodes.items():
+                for name, value in node.params.items():
+                    self._pending_params[(node_id, name)] = value
+
+    def _take_pending_params(self) -> dict[tuple[str, str], Any]:
+        with QMutexLocker(self._mutex):
+            pending, self._pending_params = self._pending_params, {}
+            return pending
 
     def preview_consumed(self) -> None:
         """The GUI has finished displaying a report; allow the next one.
@@ -151,6 +180,15 @@ class ExecutionWorker(QThread):
                         self.msleep(5)
                     if self.isInterruptionRequested():
                         break
+
+                for (node_id, name), value in self._take_pending_params().items():
+                    try:
+                        executor.set_param(node_id, name, value)
+                    except (KeyError, CoercionError) as exc:
+                        # A half-typed value in a text field is normal while
+                        # editing; report it and keep the previous one rather
+                        # than stopping the run.
+                        self.failed.emit(f"{node_id}.{name}: {exc}")
 
                 started = time.perf_counter()
                 try:

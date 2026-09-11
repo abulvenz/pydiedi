@@ -271,11 +271,15 @@ def test_worker_reports_an_invalid_graph_instead_of_crashing(qapp, real_blocks):
     assert "required input" in failures[0]
 
 
-def test_worker_snapshots_the_graph(qapp, real_blocks):
-    """Editing while a run is in progress must not disturb it."""
+def test_worker_snapshots_the_structure(qapp, real_blocks):
+    """Adding a node mid-run must not change the order being walked.
+
+    Structure is snapshotted; parameters are not -- see the live-parameter
+    tests below.
+    """
     graph = io.load(MOTION)
-    worker = ExecutionWorker(graph, iterations=1, on_error=OnError.skip)
-    graph.nodes["mask"].params["level"] = 999  # after construction
+    worker = ExecutionWorker(graph, iterations=2, on_error=OnError.skip)
+    graph.add(Node(id="intruder", block="canny"))  # after construction
     reports = []
 
     def on_swept(report):
@@ -286,8 +290,8 @@ def test_worker_snapshots_the_graph(qapp, real_blocks):
     worker.start()
     assert spin(qapp, lambda: worker.isFinished() and reports)
     worker.wait()
-    assert graph.nodes["mask"].params["level"] == 999
     assert reports[0].ok
+    assert "intruder" not in reports[0].skipped
 
 
 def test_worker_collects_errors_in_skip_mode(qapp, real_blocks):
@@ -946,3 +950,220 @@ def _kind_out():
     from pydiedi.core.block import PortKind
 
     return PortKind.OUT
+
+
+# -- live parameters ------------------------------------------------------
+#
+# Turning a threshold while watching the preview is the central gesture of a
+# tool like this. The first version of the worker deep-copied the graph and
+# never looked at it again, so the Parameters panel had no effect on a running
+# diagram -- it silently did nothing.
+
+
+def _mask_sums(qapp, editor, before, after, settle: int = 6):
+    """Run, collect preview sums, apply `change`, collect more."""
+    sums: list[int] = []
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.run_continuous()
+    editor._worker.swept.disconnect()
+
+    def spy(report):
+        if report.previews and report.previews[0].image is not None:
+            sums.append(int(report.previews[0].image.sum()))
+        editor._worker.preview_consumed()
+
+    editor._worker.swept.connect(spy)
+    assert spin(qapp, lambda: len(sums) >= settle, timeout=10)
+    first = list(sums)
+
+    after()
+    sums.clear()
+    assert spin(qapp, lambda: len(sums) >= settle, timeout=10)
+    second = list(sums)
+
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+    return first, second
+
+
+def test_a_parameter_change_reaches_a_running_diagram(qapp, window):
+    editor = window(MOTION)
+    before, after = _mask_sums(
+        qapp,
+        editor,
+        None,
+        lambda: editor._on_parameter_changed("mask", "level", 250),
+    )
+    assert any(s > 0 for s in before), "the mask should start with some motion"
+    assert all(s == 0 for s in after), "level 250 should black the mask out"
+
+
+def test_undo_of_a_parameter_reaches_a_running_diagram(qapp, window):
+    editor = window(MOTION)
+    editor._on_parameter_changed("mask", "level", 250)
+    before, after = _mask_sums(qapp, editor, None, editor.undo)
+    assert all(s == 0 for s in before)
+    assert any(s > 0 for s in after), "undo should restore the original level"
+
+
+def test_the_newest_value_wins(qapp, real_blocks):
+    """A dragged slider must not make the worker replay every position."""
+    graph = io.load(MOTION)
+    worker = ExecutionWorker(graph, iterations=0, on_error=OnError.skip)
+    for level in range(10, 260, 10):
+        worker.set_param("mask", "level", level)
+    pending = worker._take_pending_params()
+    assert pending == {("mask", "level"): 250}
+
+
+def test_a_bad_live_value_is_reported_and_the_run_continues(qapp, real_blocks):
+    """Half-typed values are normal while editing a text field."""
+    graph = io.load(MOTION)
+    graph.nodes["video"].params["loop"] = True
+    worker = ExecutionWorker(graph, iterations=0, on_error=OnError.skip)
+    failures: list[str] = []
+    reports: list[object] = []
+    worker.failed.connect(failures.append)
+
+    def on_swept(report):
+        reports.append(report)
+        worker.preview_consumed()
+
+    worker.swept.connect(on_swept)
+    worker.start()
+    assert spin(qapp, lambda: len(reports) >= 1, timeout=10)
+
+    worker.set_param("mask", "level", "not a number")
+    assert spin(qapp, lambda: bool(failures), timeout=10)
+    assert "mask.level" in failures[0]
+
+    seen = len(reports)
+    assert spin(qapp, lambda: len(reports) > seen, timeout=10), "run should continue"
+    worker.request_stop()
+    assert spin(qapp, lambda: worker.isFinished(), timeout=10)
+    worker.wait()
+
+
+def test_setting_an_unknown_parameter_is_reported(qapp, real_blocks):
+    graph = io.load(MOTION)
+    graph.nodes["video"].params["loop"] = True
+    worker = ExecutionWorker(graph, iterations=0, on_error=OnError.skip)
+    failures: list[str] = []
+    worker.failed.connect(failures.append)
+    worker.swept.connect(lambda _r: worker.preview_consumed())
+    worker.start()
+    assert spin(qapp, lambda: worker.isRunning(), timeout=10)
+
+    worker.set_param("mask", "nonexistent", 1)
+    assert spin(qapp, lambda: bool(failures), timeout=10)
+    assert "no input 'nonexistent'" in failures[0]
+    worker.request_stop()
+    assert spin(qapp, lambda: worker.isFinished(), timeout=10)
+    worker.wait()
+
+
+def test_a_structural_change_says_it_needs_a_restart(qapp, window):
+    editor = window(MOTION)
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.run_continuous()
+    assert spin(qapp, lambda: editor._worker is not None and editor._worker.isRunning())
+
+    editor._on_palette_activated("canny")
+    assert "restart" in editor.statusBar().currentMessage()
+
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+
+
+def test_the_executor_coerces_a_live_value(real_blocks):
+    """A combo box sends the enum's name, not the member."""
+    from pydiedi.core.executor import Executor
+
+    graph = io.load(MOTION)
+    with Executor(graph) as executor:
+        executor.set_param("gray", "code", "bgr2rgb")
+        assert executor._params["gray"]["code"].name == "bgr2rgb"
+
+
+def test_the_executor_resolves_a_live_path_against_the_diagram(real_blocks):
+    from pydiedi.core.executor import Executor
+
+    graph = io.load(MOTION)
+    with Executor(graph) as executor:
+        executor.set_param("video", "path", "other.avi")
+        assert executor._params["video"]["path"] == FIXTURES / "other.avi"
+
+
+# -- the parameter panel stays in step ------------------------------------
+
+
+def _spin_values(editor):
+    from PySide6.QtWidgets import QDoubleSpinBox
+
+    return sorted(s.value() for s in editor.parameters.findChildren(QDoubleSpinBox))
+
+
+def test_showing_a_node_twice_leaves_one_form(window):
+    """deleteLater() only takes effect on the next turn of the event loop.
+
+    Relying on it alone left both forms stacked in the panel, so the stale
+    values were still on screen -- and still found by anything inspecting it.
+    """
+    editor = window(MOTION)
+    editor.parameters.show_node("mask")
+    first = _spin_values(editor)
+    editor.parameters.show_node("mask")
+    assert _spin_values(editor) == first
+
+
+def test_switching_nodes_does_not_stack_forms(window):
+    editor = window(MOTION)
+    editor.parameters.show_node("mask")
+    editor.parameters.show_node("edges") if "edges" in editor.session.graph.nodes else None
+    editor.parameters.show_node("gray")
+    from PySide6.QtWidgets import QComboBox
+
+    # cvt_color has exactly one enum parameter.
+    assert len(editor.parameters.findChildren(QComboBox)) == 1
+
+
+def test_undo_keeps_the_node_selected_and_its_panel_open(window):
+    """Losing the panel on every Ctrl+Z makes undo useless for tweaking."""
+    editor = window(MOTION)
+    editor.scene.select_node("mask")
+    editor._on_parameter_changed("mask", "level", 99)
+    editor.undo()
+    assert editor.parameters.current_node_id() == "mask"
+    assert editor.scene.selected_node_ids() == ["mask"]
+
+
+def test_the_panel_shows_the_value_after_undo_and_redo(window):
+    editor = window(MOTION)
+    editor.scene.select_node("mask")
+    before = _spin_values(editor)
+
+    editor._on_parameter_changed("mask", "level", 99)
+    editor.parameters.show_node("mask")
+    assert _spin_values(editor) != before
+
+    editor.undo()
+    assert _spin_values(editor) == before
+    assert editor.session.graph.nodes["mask"].params.get("level") == 40
+
+    editor.redo()
+    assert editor.session.graph.nodes["mask"].params.get("level") == 99
+    assert 99.0 in _spin_values(editor)
+
+
+def test_the_panel_clears_when_its_node_is_deleted(window):
+    editor = window(MOTION)
+    editor.scene.select_node("mask")
+    editor._on_delete_requested(["mask"], [])
+    assert editor.parameters.current_node_id() is None
+
+
+def test_opening_another_document_clears_the_panel(window):
+    editor = window(MOTION)
+    editor.scene.select_node("mask")
+    editor.open_path(BASIC)
+    assert editor.parameters.current_node_id() is None

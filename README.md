@@ -200,6 +200,19 @@ positions and a spin box emits a value per keystroke, so `MoveNode` and
 per event. And `modified` is undo-aware: undoing back to the last save clears
 the asterisk instead of leaving the document dirty forever.
 
+### Live parameters
+
+Changing a parameter takes effect on a running diagram's next sweep, which is
+the whole reason to have a preview next to the controls. Structure does not:
+adding a node or an edge mid-sweep would change the execution order underneath
+the loop walking it, so the worker keeps a structural snapshot and the status
+bar says a restart is needed.
+
+Values are queued and applied between sweeps on the worker's own thread rather
+than written into the executor from the GUI thread, and the newest value for a
+parameter wins — a dragged slider should not make the worker replay every
+intermediate position.
+
 ### Threading
 
 The editor runs the executor on a worker thread. Blocks return `Preview`
@@ -280,7 +293,7 @@ red node does not halt the diagram.
 ## Test
 
 ```sh
-uv run pytest            # 284 tests, GUI included (offscreen)
+uv run pytest            # 298 tests, GUI included (offscreen)
 ```
 
 ## Known limitations

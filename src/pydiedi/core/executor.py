@@ -36,27 +36,34 @@ __all__ = [
 ]
 
 
-def coerce_params(
-    node: Node, spec: BlockSpec, base_dir: Path | None = None
-) -> dict[str, Any]:
-    """Map a node's YAML literals onto the types its ports declare.
+def coerce_param(
+    value: Any, port: Any, base_dir: Path | None = None
+) -> Any:
+    """Map one YAML literal onto the type its port declares.
 
     Relative ``Path`` values are resolved against ``base_dir`` -- the directory
     of the diagram file -- so that a diagram and its data can be moved or
     checked out anywhere.
     """
+    resolved = coerce(value, port.type)
+    if base_dir is not None and isinstance(resolved, Path) and not resolved.is_absolute():
+        resolved = base_dir / resolved
+    return resolved
+
+
+def coerce_params(
+    node: Node, spec: BlockSpec, base_dir: Path | None = None
+) -> dict[str, Any]:
+    """Map a node's YAML literals onto the types its ports declare."""
     coerced: dict[str, Any] = {}
     for key, value in node.params.items():
         port = spec.input(key)
         if port is None:
             continue  # reported by Graph.validate()
         try:
-            resolved = coerce(value, port.type)
+            coerced[key] = coerce_param(value, port, base_dir)
         except CoercionError as exc:
             raise CoercionError(f"{node.where()}: param {key!r}: {exc}") from None
-        if base_dir is not None and isinstance(resolved, Path) and not resolved.is_absolute():
-            resolved = base_dir / resolved
-        coerced[key] = resolved
     return coerced
 
 
@@ -252,6 +259,26 @@ class Executor:
     @property
     def stateful_nodes(self) -> list[str]:
         return [n for n, spec in self._specs.items() if spec.is_stateful]
+
+    def set_param(self, node_id: str, name: str, value: Any) -> None:
+        """Change a parameter of a running diagram, effective next sweep.
+
+        Turning a threshold while watching the output is the central gesture of
+        a tool like this, so parameters must be live. Structure is not: adding
+        a node or an edge mid-sweep would change the execution order underneath
+        the loop that is walking it, and needs a restart.
+
+        Call this from the thread that runs :meth:`step`. The editor's worker
+        queues changes and applies them here between sweeps rather than writing
+        from the GUI thread.
+        """
+        spec = self._specs.get(node_id)
+        if spec is None:
+            raise KeyError(f"no such node: {node_id}")
+        port = spec.input(name)
+        if port is None:
+            raise KeyError(f"block {spec.name!r} has no input {name!r}")
+        self._params[node_id][name] = coerce_param(value, port, self.graph.base_dir)
 
     def step(self, iteration: int = 0) -> RunResult:
         """Execute every node once, in order."""

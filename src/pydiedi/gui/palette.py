@@ -150,13 +150,30 @@ class ParameterEditor(QWidget):
         self._layout.addWidget(self._placeholder)
         self._form_host: QWidget | None = None
 
-    def set_graph(self, graph: Graph | None) -> None:
+    def current_node_id(self) -> str | None:
+        return self._node_id
+
+    def set_graph(self, graph: Graph | None, keep_selection: bool = False) -> None:
+        """Point the editor at a graph.
+
+        ``keep_selection`` is for a rebuild of the same document -- after an
+        undo, say -- where clearing the panel would take away the very thing
+        the user was working in.
+        """
+        shown = self._node_id if keep_selection else None
         self._graph = graph
-        self.show_node(None)
+        self.show_node(shown if graph is not None and shown in graph.nodes else None)
 
     def show_node(self, node_id: str | None) -> None:
         self._node_id = node_id
         if self._form_host is not None:
+            # Detached from the layout here and now. deleteLater() alone only
+            # takes effect on the next turn of the event loop, so two calls in
+            # quick succession -- clicking through nodes, or an undo that
+            # re-shows the same node -- would leave both forms stacked in the
+            # panel, showing stale values.
+            self._layout.removeWidget(self._form_host)
+            self._form_host.setParent(None)
             self._form_host.deleteLater()
             self._form_host = None
 

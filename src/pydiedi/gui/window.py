@@ -225,16 +225,29 @@ class EditorWindow(QMainWindow):
     def _apply_graph(self, graph: Graph) -> None:
         """Load a new document: rebuild the scene and drop the undo history."""
         self.session.reset(graph)
-        self._refresh_scene()
+        # A different document, so nothing is worth carrying over.
+        self._refresh_scene(keep_selection=False)
         self.previews.clear()
         self._update_title()
         self._update_status()
 
-    def _refresh_scene(self) -> None:
+    def _refresh_scene(self, keep_selection: bool = True) -> None:
+        """Re-render the current document.
+
+        The selection is carried across, because a rebuild happens after an
+        undo -- and losing the node you were editing, along with its parameter
+        panel, every time you press Ctrl+Z makes the undo useless for the very
+        thing it is most used on.
+        """
         graph = self.session.graph
+        selected = self.scene.selected_node_ids() if keep_selection else []
         specs, problems = self._specs_for(graph)
         self.scene.set_graph(graph, specs)
-        self.parameters.set_graph(graph)
+        self.parameters.set_graph(graph, keep_selection=keep_selection)
+        for node_id in selected:
+            if node_id in graph.nodes:
+                self.scene.select_node(node_id)
+                break
         for problem in problems:
             self._log(f"warning: {problem}")
 
@@ -334,7 +347,25 @@ class EditorWindow(QMainWindow):
         except EditError as exc:
             self._log(f"refused: {exc}")
             return
+        # Parameters are live: a running diagram picks the new value up on its
+        # next sweep, which is what makes turning a threshold while watching
+        # the preview worth doing at all.
+        if self._worker is not None:
+            self._worker.set_param(node_id, name, value)
         self._mark_dirty()
+
+    def _note_structural_change(self) -> None:
+        """Tell the user that this kind of edit needs a restart.
+
+        Parameters reach a running diagram; structure does not, because adding
+        a node or an edge mid-sweep would change the execution order underneath
+        the loop walking it. Saying so is better than appearing to ignore the
+        edit.
+        """
+        if self._worker is not None:
+            self.statusBar().showMessage(
+                "Structure changed — restart the run for it to take effect", 5000
+            )
 
     def _on_node_moved(self, node_id: str, x: float, y: float) -> None:
         self.session.move_node(node_id, (x, y))
@@ -420,12 +451,15 @@ class EditorWindow(QMainWindow):
         self._log(message)
         self._mark_dirty()
         self._update_status()
+        self._note_structural_change()
 
     def undo(self) -> None:
         description = self.session.undo()
         if description is None:
             return
         self._refresh_scene()
+        if self._worker is not None:
+            self._worker.sync_params(self.session.graph)
         self._after_edit(f"undo: {description}")
 
     def redo(self) -> None:
@@ -433,6 +467,8 @@ class EditorWindow(QMainWindow):
         if description is None:
             return
         self._refresh_scene()
+        if self._worker is not None:
+            self._worker.sync_params(self.session.graph)
         self._after_edit(f"redo: {description}")
 
     def _update_edit_actions(self) -> None:
