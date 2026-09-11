@@ -83,6 +83,8 @@ class EditorWindow(QMainWindow):
         self.scene.delete_requested.connect(self._on_delete_requested)
         self.scene.rename_requested.connect(self._on_rename_requested)
         self.scene.block_dropped.connect(self._on_block_dropped)
+        self.scene.watches_changed.connect(self._on_watches_changed)
+        self.scene.port_clicked.connect(self._on_port_clicked)
         self.parameters.parameter_changed.connect(self._on_parameter_changed)
         self.palette_widget.block_activated.connect(self._on_palette_activated)
 
@@ -202,6 +204,8 @@ class EditorWindow(QMainWindow):
         add(view_menu, "Zoom &out", lambda: self.view.zoom_by(1 / 1.2), "Ctrl+-")
         view_menu.addSeparator()
         add(view_menu, "&Auto layout", self.auto_layout, "Ctrl+L", True)
+        view_menu.addSeparator()
+        add(view_menu, "Clear &watched ports", self.scene.clear_watches, "Ctrl+W")
 
         self.action_stop.setEnabled(False)
 
@@ -447,6 +451,23 @@ class EditorWindow(QMainWindow):
         self.scene.select_node(new_id)
         self._after_edit(f"renamed {node_id} to {new_id}")
 
+    def _on_watches_changed(self, ports: set) -> None:
+        if self._worker is not None:
+            self._worker.set_watched(ports)
+        if not ports:
+            self.scene.show_port_values([])
+
+    def _on_port_clicked(self, node_id: str, port: str, watched: bool) -> None:
+        if not watched:
+            self.statusBar().showMessage(f"{node_id}.{port}: not watched", 2000)
+            return
+        if self._worker is None:
+            self.statusBar().showMessage(
+                f"Watching {node_id}.{port} — run the diagram to see its value", 4000
+            )
+        else:
+            self.statusBar().showMessage(f"Watching {node_id}.{port}", 2000)
+
     def _after_edit(self, message: str) -> None:
         self._log(message)
         self._mark_dirty()
@@ -559,6 +580,7 @@ class EditorWindow(QMainWindow):
         worker.stopped.connect(self._on_stopped)
         worker.finished.connect(self._on_worker_finished)
         self._worker = worker
+        worker.set_watched(self.scene.watched_ports())
 
         self.action_run.setEnabled(False)
         self.action_step.setEnabled(False)
@@ -573,6 +595,12 @@ class EditorWindow(QMainWindow):
 
     def _on_swept(self, report: SweepReport) -> None:
         self.previews.show_previews(report.previews)
+        # The same data, drawn where it was produced. flodiedi showed
+        # previews on the node too, which is what makes a graph readable at
+        # a glance -- it just did it by letting blocks build widgets.
+        self.scene.show_previews(report.previews_by_node)
+        if report.watched:
+            self.scene.show_port_values(report.watched)
         self.scene.set_errors(report.errors)
         for node_id, message in report.errors.items():
             self._log(f"error in {node_id}: {message}")

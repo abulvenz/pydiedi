@@ -20,6 +20,7 @@ from __future__ import annotations
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
+    QPixmap,
     QColor,
     QFont,
     QFontMetrics,
@@ -62,6 +63,15 @@ COLOUR_EDGE = QColor("#6d7488")
 COLOUR_BACKGROUND = QColor("#22242a")
 COLOUR_GRID = QColor("#282b32")
 COLOUR_INVALID = QColor("#f7768e")
+COLOUR_VALUE = QColor("#9ece6a")
+
+THUMBNAIL_MARGIN = 8.0
+THUMBNAIL_MAX_HEIGHT = 90.0
+VALUE_LINE_HEIGHT = 13.0
+
+CLICK_SLOP = 4
+"""Movement below this is a click, not a drag. Ports are small, and a few
+pixels of wobble between press and release is normal."""
 
 SNAP_RADIUS = 45.0
 """How far a dragged connection reaches for a compatible port, in scene units.
@@ -102,6 +112,7 @@ class PortItem(QGraphicsItem):
         self.setToolTip(f"{port.name}: {port.type_name}")
         self._hovered = False
         self._highlighted = False
+        self._watched = False
 
     def boundingRect(self) -> QRectF:  # noqa: N802 - Qt naming
         r = PORT_RADIUS + 2
@@ -116,6 +127,10 @@ class PortItem(QGraphicsItem):
             painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(colour.lighter(140), 1.5))
             painter.drawEllipse(QPointF(0, 0), radius + 4.0, radius + 4.0)
+        if self._watched:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(COLOUR_VALUE, 1.5))
+            painter.drawEllipse(QPointF(0, 0), radius + 3.0, radius + 3.0)
         painter.setBrush(QBrush(colour))
         painter.setPen(QPen(colour.darker(160), 1.0))
         painter.drawEllipse(QPointF(0, 0), radius, radius)
@@ -124,6 +139,12 @@ class PortItem(QGraphicsItem):
         if self.node.port_is_unsatisfied(self):
             painter.setBrush(QBrush(COLOUR_NODE))
             painter.drawEllipse(QPointF(0, 0), radius - 2.0, radius - 2.0)
+
+    def set_watched(self, on: bool) -> None:
+        """Mark this port as one whose value is being reported."""
+        if on != self._watched:
+            self._watched = on
+            self.update()
 
     def set_highlighted(self, on: bool) -> None:
         """Mark this port as a legal target while a connection is dragged."""
@@ -158,6 +179,8 @@ class NodeItem(QGraphicsItem):
         self.setCursor(Qt.OpenHandCursor)
         self.setZValue(1.0)
 
+        self._thumbnail: QPixmap | None = None
+        self._value_text: str = ""
         self._inputs: list[PortItem] = []
         self._outputs: list[PortItem] = []
         self._build_ports()
@@ -174,7 +197,53 @@ class NodeItem(QGraphicsItem):
 
     def _compute_height(self) -> float:
         rows = max(len(self._inputs), len(self._outputs), 1)
-        return NODE_HEADER + rows * PORT_SPACING + NODE_PADDING
+        height = NODE_HEADER + rows * PORT_SPACING + NODE_PADDING
+        if self._thumbnail is not None:
+            height += self._thumbnail_rect().height() + 6.0
+        if self._value_text:
+            height += VALUE_LINE_HEIGHT
+        return height
+
+    def _thumbnail_rect(self) -> QRectF:
+        """Where the inline preview goes, scaled to fit the node's width."""
+        if self._thumbnail is None:
+            return QRectF()
+        available = NODE_WIDTH - 2 * THUMBNAIL_MARGIN
+        scale = min(
+            available / max(1, self._thumbnail.width()),
+            THUMBNAIL_MAX_HEIGHT / max(1, self._thumbnail.height()),
+        )
+        width = self._thumbnail.width() * scale
+        height = self._thumbnail.height() * scale
+        rows = max(len(self._inputs), len(self._outputs), 1)
+        top = NODE_HEADER + rows * PORT_SPACING + 3.0
+        return QRectF((NODE_WIDTH - width) / 2.0, top, width, height)
+
+    def set_thumbnail(self, pixmap: QPixmap | None) -> None:
+        """Show an image inside the node.
+
+        flodiedi did this too, but by hosting a real ``QWidget`` in a
+        ``QGraphicsProxyWidget`` that the *block* created -- which is how
+        painting ended up on the worker thread. Here the block returns a
+        Preview and the item draws it; nothing crosses a thread boundary that
+        is not already a queued signal.
+        """
+        if pixmap is None and self._thumbnail is None:
+            return
+        self.prepareGeometryChange()
+        self._thumbnail = pixmap
+        self._height = self._compute_height()
+        self._place_ports()
+        self.update()
+
+    def set_value_text(self, text: str) -> None:
+        """A one-line value readout under the ports, for a watched port."""
+        if text == self._value_text:
+            return
+        self.prepareGeometryChange()
+        self._value_text = text
+        self._height = self._compute_height()
+        self.update()
 
     def _place_ports(self) -> None:
         for index, item in enumerate(self._inputs):
@@ -256,8 +325,30 @@ class NodeItem(QGraphicsItem):
                 item.port.name,
             )
 
+        if self._thumbnail is not None:
+            target = self._thumbnail_rect()
+            painter.setPen(QPen(COLOUR_BORDER, 1.0))
+            painter.setBrush(QBrush(QColor("#15171b")))
+            painter.drawRect(target.adjusted(-1, -1, 1, 1))
+            painter.drawPixmap(target, self._thumbnail, QRectF(self._thumbnail.rect()))
+
+        if self._value_text:
+            painter.setFont(label_font)
+            painter.setPen(QPen(COLOUR_VALUE))
+            painter.drawText(
+                QRectF(
+                    6,
+                    self._height - NODE_PADDING - VALUE_LINE_HEIGHT,
+                    NODE_WIDTH - 12,
+                    VALUE_LINE_HEIGHT,
+                ),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                _elide(self._value_text, label_font, NODE_WIDTH - 12),
+            )
+
         # The block name, small, under the node id -- two 'cvt_color' nodes
         # named gray_live and gray_ref still show what they are.
+        painter.setFont(label_font)
         painter.setPen(QPen(COLOUR_SUBTEXT))
         painter.drawText(
             QRectF(8, self._height - NODE_PADDING - 2, NODE_WIDTH - 16, NODE_PADDING + 2),
@@ -392,6 +483,10 @@ class DiagramScene(QGraphicsScene):
     """A block name dragged in from the palette, and where it was dropped."""
     rename_requested = Signal(str)
     """The node id the user wants to rename."""
+    watches_changed = Signal(set)
+    """The set of (node id, port) the GUI wants values for."""
+    port_clicked = Signal(str, str, bool)
+    """node id, port, now watched -- a port was clicked without dragging."""
 
     def __init__(self, parent: object | None = None) -> None:
         super().__init__(parent)
@@ -406,6 +501,8 @@ class DiagramScene(QGraphicsScene):
         self._building = False
         self._pending: PendingConnection | None = None
         self._candidates: list[PortItem] = []
+        self._watched: set[tuple[str, str]] = set()
+        self._press_point: QPointF | None = None
         self.selectionChanged.connect(self._on_selection_changed)
 
     # -- building ---------------------------------------------------------
@@ -562,6 +659,72 @@ class DiagramScene(QGraphicsScene):
         for node_id, item in self._nodes.items():
             item.set_error(errors.get(node_id))
 
+    def show_previews(self, previews_by_node: dict[str, list]) -> None:
+        """Draw each preview inside the node that produced it."""
+        from .preview import to_qimage
+
+        for node_id, item in self._nodes.items():
+            previews = previews_by_node.get(node_id)
+            image = previews[0].image if previews else None
+            if image is None:
+                item.set_thumbnail(None)
+                continue
+            try:
+                item.set_thumbnail(QPixmap.fromImage(to_qimage(image)))
+            except ValueError:
+                item.set_thumbnail(None)
+        self.refresh_edges()
+
+    def clear_previews(self) -> None:
+        for item in self._nodes.values():
+            item.set_thumbnail(None)
+            item.set_value_text("")
+        self.refresh_edges()
+
+    # -- watching port values ---------------------------------------------
+
+    def toggle_watch(self, node_id: str, port: str) -> bool:
+        """Start or stop watching a port. Returns whether it is now watched."""
+        key = (node_id, port)
+        if key in self._watched:
+            self._watched.discard(key)
+            watched_now = False
+        else:
+            self._watched.add(key)
+            watched_now = True
+        self._apply_watch_marks()
+        self.watches_changed.emit(set(self._watched))
+        return watched_now
+
+    def watched_ports(self) -> set[tuple[str, str]]:
+        return set(self._watched)
+
+    def clear_watches(self) -> None:
+        if not self._watched:
+            return
+        self._watched.clear()
+        self._apply_watch_marks()
+        for item in self._nodes.values():
+            item.set_value_text("")
+        self.watches_changed.emit(set())
+
+    def _apply_watch_marks(self) -> None:
+        for node_id, node_item in self._nodes.items():
+            for child in node_item.childItems():
+                if isinstance(child, PortItem):
+                    child.set_watched((node_id, child.port.name) in self._watched)
+
+    def show_port_values(self, values: list) -> None:
+        """Display the latest value of every watched port on its node."""
+        by_node: dict[str, list[str]] = {}
+        for value in values:
+            by_node.setdefault(value.node_id, []).append(
+                f"{value.port} = {value.summary}"
+            )
+        for node_id, item in self._nodes.items():
+            item.set_value_text(" | ".join(by_node.get(node_id, ())))
+        self.refresh_edges()
+
     def clear_errors(self) -> None:
         for item in self._nodes.values():
             item.set_error(None)
@@ -696,6 +859,7 @@ class DiagramScene(QGraphicsScene):
         if event.button() == Qt.LeftButton:  # type: ignore[attr-defined]
             port = self._port_at(event.scenePos())  # type: ignore[attr-defined]
             if port is not None:
+                self._press_point = event.scenePos()  # type: ignore[attr-defined]
                 self._pending = PendingConnection(port)
                 self._candidates = self._collect_candidates(port)
                 for candidate in self._candidates:
@@ -722,9 +886,20 @@ class DiagramScene(QGraphicsScene):
             origin = self._pending.origin
             point = event.scenePos()  # type: ignore[attr-defined]
             target = self._snap_target(point) or self._port_at(point)
+            moved = self._press_point is not None and (
+                (point - self._press_point).manhattanLength() > CLICK_SLOP
+            )
             self._end_pending()
+            self._press_point = None
+
             if target is not None and target is not origin:
                 self._request_connection(origin, target)
+            elif not moved:
+                # Pressed and released on the same port without dragging: the
+                # user wants to see what is on it, not to wire it up.
+                node_id = origin.node.node_id
+                watched = self.toggle_watch(node_id, origin.port.name)
+                self.port_clicked.emit(node_id, origin.port.name, watched)
             event.accept()  # type: ignore[attr-defined]
             return
         super().mouseReleaseEvent(event)  # type: ignore[arg-type]

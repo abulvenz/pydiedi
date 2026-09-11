@@ -170,7 +170,12 @@ class RunResult:
     order: list[str] = field(default_factory=list)
     outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Per node id, its output ports and their values."""
-    previews: list[Preview] = field(default_factory=list)
+    previews_by_node: dict[str, list[Preview]] = field(default_factory=dict)
+    """Which node produced which previews.
+
+    Needed so a renderer can draw a preview *on* the node that made it, rather
+    than in an anonymous list beside the diagram.
+    """
     iteration: int = 0
     errors: dict[str, NodeExecutionError] = field(default_factory=dict)
     """Nodes that raised, when running with ``on_error='skip'``."""
@@ -181,6 +186,11 @@ class RunResult:
 
     def value(self, node_id: str, port: str) -> Any:
         return self.outputs[node_id][port]
+
+    @property
+    def previews(self) -> list[Preview]:
+        """Every preview, in execution order."""
+        return [p for node_id in self.order for p in self.previews_by_node.get(node_id, ())]
 
     @property
     def ok(self) -> bool:
@@ -315,7 +325,7 @@ class Executor:
             result.outputs[node_id] = produced
             for port_name, value in produced.items():
                 if isinstance(value, Preview):
-                    result.previews.append(value)
+                    result.previews_by_node.setdefault(node_id, []).append(value)
                 for edge in self.graph.outgoing(node_id):
                     if edge.src_port == port_name:
                         wire[(edge.dst, edge.dst_port)] = value

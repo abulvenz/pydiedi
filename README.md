@@ -62,6 +62,20 @@ Parameters on the right are generated from the block's type hints — a combo bo
 for an enum, a file chooser for a `Path`, and an input fed by a connection is
 shown disabled.
 
+**Previews appear on the node that produced them**, not only in the side panel,
+which is what makes a running graph readable at a glance. **Clicking a port**
+shows the value currently on it — `Mat 96x96 uint8, 0..218` for an image, with a
+thumbnail, or `int 252` for a number. Clicking an *input* shows what arrives
+there, resolved through the connection, which is the useful thing to see when a
+block misbehaves. `Ctrl+W` clears the readouts.
+
+Both were flodiedi features worth keeping. It built them by letting blocks
+create `QWidget`s hosted in `QGraphicsProxyWidget`s, which is exactly how
+painting ended up on the worker thread; here the block returns a `Preview` and
+the renderer draws it. Values are summarised on the worker thread and only the
+summary crosses over, so a 4K frame stays where it was produced — and nothing
+is summarised at all unless a port is being watched.
+
 While a connection is being dragged, every port it could legally land on is
 haloed and the line reaches for the nearest one. flodiedi did the same and it
 was one of the better parts of its editor: ports are small, and having the line
@@ -147,7 +161,8 @@ result is visible in its own repository: `loadPointCloudplugin` shipped with
 
 ```
 pydiedi/
-├── core/          no Qt, no cv2 — graph, executor, blocks, edit commands, file format
+├── core/          no Qt, no cv2 — graph, executor, blocks, edit commands,
+│                  value inspection, file format
 ├── blocks/        the block library; cv2 and numpy, never a GUI toolkit
 │   ├── sources.py     camera, video_file, frame_buffer  (stateful)
 │   ├── imageio.py     imread, imwrite
@@ -293,7 +308,7 @@ red node does not halt the diagram.
 ## Test
 
 ```sh
-uv run pytest            # 298 tests, GUI included (offscreen)
+uv run pytest            # 348 tests, GUI included (offscreen)
 ```
 
 ## Known limitations

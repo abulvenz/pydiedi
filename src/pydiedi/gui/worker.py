@@ -42,6 +42,7 @@ from PySide6.QtCore import QMutex, QMutexLocker, QThread, Signal
 from ..core import registry
 from ..core.executor import Executor, NodeExecutionError, OnError, StopExecution
 from ..core.graph import Graph, ValidationError
+from ..core.inspect import PortValue, inspect_value
 from ..core.types import CoercionError, Preview
 
 __all__ = ["ExecutionWorker", "SweepReport"]
@@ -54,13 +55,22 @@ class SweepReport:
     Deliberately not the :class:`~pydiedi.core.executor.RunResult` itself: that
     holds every intermediate value of the whole graph, and keeping those alive
     across a thread boundary would pin every frame of a running pipeline.
+    Values the user asked to watch are summarised into
+    :class:`~pydiedi.core.inspect.PortValue` first, so what travels is a line of
+    text and at most a thumbnail.
     """
 
     iteration: int
-    previews: list[Preview] = field(default_factory=list)
+    previews_by_node: dict[str, list[Preview]] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     skipped: list[str] = field(default_factory=list)
     duration_ms: float = 0.0
+    watched: list[PortValue] = field(default_factory=list)
+    """Values for the ports the GUI asked to watch."""
+
+    @property
+    def previews(self) -> list[Preview]:
+        return [p for previews in self.previews_by_node.values() for p in previews]
 
     @property
     def ok(self) -> bool:
@@ -98,6 +108,7 @@ class ExecutionWorker(QThread):
         self._mutex = QMutex()
         self._in_flight = 0
         self._pending_params: dict[tuple[str, str], Any] = {}
+        self._watched: set[tuple[str, str]] = set()
 
     # -- called from the GUI thread ---------------------------------------
 
@@ -131,6 +142,60 @@ class ExecutionWorker(QThread):
         with QMutexLocker(self._mutex):
             pending, self._pending_params = self._pending_params, {}
             return pending
+
+    def set_watched(self, ports: set[tuple[str, str]]) -> None:
+        """Choose which ports report their value with each sweep.
+
+        Only what is asked for is summarised, so watching one port costs one
+        thumbnail per sweep rather than shipping the whole graph's intermediate
+        values across the thread boundary.
+        """
+        with QMutexLocker(self._mutex):
+            self._watched = set(ports)
+
+    def _current_watches(self) -> set[tuple[str, str]]:
+        with QMutexLocker(self._mutex):
+            return set(self._watched)
+
+    def _collect_watched(self, result: object, iteration: int) -> list[PortValue]:
+        watches = self._current_watches()
+        if not watches:
+            return []
+        values: list[PortValue] = []
+        for node_id, port in sorted(watches):
+            source = self._resolve(node_id, port)
+            if source is None:
+                continue
+            source_node, source_port = source
+            outputs = result.outputs.get(source_node)  # type: ignore[attr-defined]
+            if outputs is None or source_port not in outputs:
+                # The node was skipped after an upstream failure.
+                continue
+            values.append(
+                inspect_value(node_id, port, outputs[source_port], iteration)
+            )
+        return values
+
+    def _resolve(self, node_id: str, port: str) -> tuple[str, str] | None:
+        """Find where a watched port gets its value.
+
+        An output carries its own. An input carries whatever is wired into
+        it, which is the more interesting thing to see: clicking the input of
+        a failing block shows what actually arrived there.
+        """
+        node = self._graph.nodes.get(node_id)
+        if node is None:
+            return None
+        try:
+            spec = registry.get(node.block)
+        except registry.UnknownBlockError:
+            return None
+        if spec.output(port) is not None:
+            return (node_id, port)
+        for edge in self._graph.incoming(node_id):
+            if edge.dst_port == port:
+                return (edge.src, edge.src_port)
+        return None
 
     def preview_consumed(self) -> None:
         """The GUI has finished displaying a report; allow the next one.
@@ -206,10 +271,14 @@ class ExecutionWorker(QThread):
                     self.swept.emit(
                         SweepReport(
                             iteration=iteration,
-                            previews=list(result.previews),
+                            previews_by_node={
+                                node: list(previews)
+                                for node, previews in result.previews_by_node.items()
+                            },
                             errors={n: str(e) for n, e in result.errors.items()},
                             skipped=list(result.skipped),
                             duration_ms=elapsed_ms,
+                            watched=self._collect_watched(result, iteration),
                         )
                     )
                 iteration += 1

@@ -1167,3 +1167,208 @@ def test_opening_another_document_clears_the_panel(window):
     editor.scene.select_node("mask")
     editor.open_path(BASIC)
     assert editor.parameters.current_node_id() is None
+
+
+# -- previews drawn on the node -------------------------------------------
+#
+# flodiedi put the preview on the node too, which is what makes a running graph
+# readable at a glance. It did it by letting the *block* build a QWidget and
+# host it in a proxy item, which is how painting ended up on the worker thread.
+# Here the block returns a Preview and the item draws it.
+
+
+def test_a_preview_is_drawn_inside_the_node_that_made_it(qapp, window):
+    editor = window(MOTION)
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    assert editor.scene._nodes["show"]._thumbnail is not None
+    assert editor.scene._nodes["gray"]._thumbnail is None, "only preview blocks"
+
+
+def test_a_node_with_a_preview_is_taller(qapp, window):
+    editor = window(MOTION)
+    before = editor.scene._nodes["show"].boundingRect().height()
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    assert editor.scene._nodes["show"].boundingRect().height() > before
+
+
+def test_previews_are_cleared_when_the_document_changes(qapp, window):
+    editor = window(MOTION)
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    editor.scene.clear_previews()
+    assert editor.scene._nodes["show"]._thumbnail is None
+
+
+def test_a_preview_with_no_image_does_not_break_the_node(qapp, window):
+    from pydiedi.core.types import Preview as CorePreview
+
+    editor = window(MOTION)
+    editor.scene.show_previews({"show": [CorePreview(image=None)]})
+    assert editor.scene._nodes["show"]._thumbnail is None
+
+
+def test_run_result_attributes_previews_to_their_node(real_blocks):
+    from pydiedi.core.executor import Executor
+
+    graph = io.load(MOTION)
+    with Executor(graph) as executor:
+        result = executor.step()
+    assert list(result.previews_by_node) == ["show"]
+    assert len(result.previews) == 1
+
+
+# -- watching a port ------------------------------------------------------
+
+
+def test_clicking_a_port_starts_watching_it(window):
+    editor = window(MOTION)
+    assert editor.scene.toggle_watch("motion", "output") is True
+    assert ("motion", "output") in editor.scene.watched_ports()
+    assert editor.scene.toggle_watch("motion", "output") is False
+    assert editor.scene.watched_ports() == set()
+
+
+def test_a_watched_port_is_marked(window):
+    from pydiedi.gui.canvas import PortItem
+
+    editor = window(MOTION)
+    editor.scene.toggle_watch("motion", "output")
+    port = editor.scene._nodes["motion"].port_item("output", _kind_out())
+    assert isinstance(port, PortItem)
+    assert port._watched is True
+
+
+def test_a_watched_output_reports_its_value(qapp, window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("motion", "output")
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    assert "output = int" in editor.scene._nodes["motion"]._value_text
+
+
+def test_a_watched_input_reports_what_arrives_there(qapp, window):
+    """An input carries whatever is wired into it, which is the useful thing
+    to see when a block is misbehaving."""
+    editor = window(MOTION)
+    editor.scene.toggle_watch("mask", "input")
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    text = editor.scene._nodes["mask"]._value_text
+    assert text.startswith("input = Mat")
+
+
+def test_an_unconnected_input_reports_nothing_rather_than_guessing(qapp, window):
+    editor = window(None)
+    editor._on_palette_activated("canny")
+    editor.scene.toggle_watch("canny", "input")
+    assert editor.scene._nodes["canny"]._value_text == ""
+
+
+def test_watches_reach_a_worker_started_afterwards(qapp, window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("motion", "output")
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    assert editor.scene._nodes["motion"]._value_text != ""
+
+
+def test_watching_while_running_takes_effect(qapp, window):
+    editor = window(MOTION)
+    editor.session.graph.nodes["video"].params["loop"] = True
+    editor.run_continuous()
+    assert spin(qapp, lambda: editor._worker is not None and editor._worker.isRunning())
+    editor.scene.toggle_watch("motion", "output")
+    assert spin(
+        qapp,
+        lambda: editor.scene._nodes["motion"]._value_text != "",
+        timeout=10,
+    )
+    editor.stop()
+    assert spin(qapp, lambda: editor._worker is None, timeout=10)
+
+
+def test_clearing_watches_removes_the_readouts(qapp, window):
+    editor = window(MOTION)
+    editor.scene.toggle_watch("motion", "output")
+    editor.run_once()
+    assert spin(qapp, lambda: editor._worker is None, timeout=15)
+    editor.scene.clear_watches()
+    assert editor.scene._nodes["motion"]._value_text == ""
+    assert editor.scene.watched_ports() == set()
+
+
+def test_nothing_is_summarised_when_nothing_is_watched(qapp, real_blocks):
+    """Watching costs a thumbnail per sweep; not watching must cost nothing."""
+    graph = io.load(MOTION)
+    worker = ExecutionWorker(graph, iterations=1, on_error=OnError.skip)
+    reports = []
+
+    def on_swept(report):
+        reports.append(report)
+        worker.preview_consumed()
+
+    worker.swept.connect(on_swept)
+    worker.start()
+    assert spin(qapp, lambda: worker.isFinished() and reports)
+    worker.wait()
+    assert reports[0].watched == []
+
+
+def test_only_watched_ports_are_summarised(qapp, real_blocks):
+    graph = io.load(MOTION)
+    worker = ExecutionWorker(graph, iterations=1, on_error=OnError.skip)
+    worker.set_watched({("motion", "output")})
+    reports = []
+
+    def on_swept(report):
+        reports.append(report)
+        worker.preview_consumed()
+
+    worker.swept.connect(on_swept)
+    worker.start()
+    assert spin(qapp, lambda: worker.isFinished() and reports)
+    worker.wait()
+    assert [v.key for v in reports[0].watched] == [("motion", "output")]
+    assert reports[0].watched[0].summary.startswith("int ")
+
+
+def test_a_watched_image_carries_a_thumbnail_not_the_frame(qapp, real_blocks):
+    graph = io.load(MOTION)
+    worker = ExecutionWorker(graph, iterations=1, on_error=OnError.skip)
+    worker.set_watched({("gray", "output")})
+    reports = []
+
+    def on_swept(report):
+        reports.append(report)
+        worker.preview_consumed()
+
+    worker.swept.connect(on_swept)
+    worker.start()
+    assert spin(qapp, lambda: worker.isFinished() and reports)
+    worker.wait()
+    value = reports[0].watched[0]
+    assert value.thumbnail is not None
+    assert max(value.thumbnail.shape[:2]) <= 160
+
+
+def test_watching_a_skipped_node_reports_nothing(qapp, real_blocks):
+    graph = Graph(name="t")
+    graph.add(Node(id="bad", block="imread", params={"path": "/nonexistent.png"}))
+    graph.add(Node(id="edge", block="canny"))
+    graph.connect("bad", "output", "edge", "input")
+    worker = ExecutionWorker(graph, iterations=1, on_error=OnError.skip)
+    worker.set_watched({("edge", "output")})
+    reports = []
+
+    def on_swept(report):
+        reports.append(report)
+        worker.preview_consumed()
+
+    worker.swept.connect(on_swept)
+    worker.start()
+    assert spin(qapp, lambda: worker.isFinished() and reports)
+    worker.wait()
+    assert reports[0].watched == []
+    assert "bad" in reports[0].errors
